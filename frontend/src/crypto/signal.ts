@@ -189,7 +189,7 @@ export class SignalService {
       
       // Add monotonic timestamp and nonce for replay protection
       payload.timestamp = Date.now();
-      payload.nonce = crypto.randomUUID();
+      payload.nonce = window.crypto.randomUUID();
       
       const payloadBytes = encoder.encode(JSON.stringify(payload));
       const signatureBuf = await window.crypto.subtle.sign(
@@ -198,7 +198,7 @@ export class SignalService {
         payloadBytes
       );
       
-      const signatureB64 = btoa(String.fromCharCode.apply(null, new Uint8Array(signatureBuf) as any));
+      const signatureB64 = btoa(String.fromCharCode(...Array.from(new Uint8Array(signatureBuf))));
 
       let innerPayload: any = {
         sender_handle: payload.from, // Explicitly declare who we claim to be
@@ -293,10 +293,13 @@ export class SignalService {
       const decoder = new TextDecoder();
       const innerPayload = JSON.parse(decoder.decode(plaintextBuf));
       
-      const claimedSender = innerPayload.sender_handle;
-      const signatureB64 = innerPayload.signature;
+      const claimedSender = innerPayload.sender_handle as string;
+      const signatureB64 = innerPayload.signature as string;
       if (!claimedSender || !signatureB64) {
         throw new Error("Missing sender handle or signature. Authentication failed.");
+      }
+      if (claimedSender !== remoteHandle) {
+        throw new Error(`CRITICAL: Identity mismatch! Message signed by ${claimedSender} but routed from ${remoteHandle}`);
       }
 
       // Fetch the claimed sender's public keys from the relay
@@ -360,7 +363,7 @@ export class SignalService {
         }
         
         // 3. Record and Prune
-        this.seenNonces[payload.nonce] = Date.now();
+        this.seenNonces[payload.nonce] = payload.timestamp;
         
         const now = Date.now();
         for (const nonce in this.seenNonces) {
