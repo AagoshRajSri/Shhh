@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0258", # h2 unbounded empty DATA frames (Isolated to aws-sdk-s3 outbound)
+    "RUSTSEC-2023-0071", # rsa Marvin Attack (Isolated to aws-sdk-s3 outbound)
+    "RUSTSEC-2026-0098", # rustls-webpki Name constraints (Isolated to aws-sdk-s3 outbound)
+    "RUSTSEC-2026-0099", # rustls-webpki Name constraints wildcard (Isolated to aws-sdk-s3 outbound)
+    "RUSTSEC-2026-0104", # rustls-webpki Reachable panic (Isolated to aws-sdk-s3 outbound)
+]

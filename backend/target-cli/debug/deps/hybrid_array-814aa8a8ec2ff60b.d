@@ -1,0 +1,11 @@
+C:\Aagosh\CODE\chat\backend\target-cli\debug\deps\hybrid_array-814aa8a8ec2ff60b.d: C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\lib.rs C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\sizes.rs C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\flatten.rs C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\from_fn.rs C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\iter.rs C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\traits.rs C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\../README.md
+
+C:\Aagosh\CODE\chat\backend\target-cli\debug\deps\libhybrid_array-814aa8a8ec2ff60b.rmeta: C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\lib.rs C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\sizes.rs C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\flatten.rs C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\from_fn.rs C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\iter.rs C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\traits.rs C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\../README.md
+
+C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\lib.rs:
+C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\sizes.rs:
+C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\flatten.rs:
+C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\from_fn.rs:
+C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\iter.rs:
+C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\traits.rs:
+C:\Users\aagos\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\hybrid-array-0.4.15\src\../README.md:
