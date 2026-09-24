@@ -55,6 +55,7 @@ export async function getMasterKey(): Promise<CryptoKey> {
 }
 
 export async function saveEncrypted(storeName: 'identity' | 'sessions' | 'prekeys', item: any, idKey: string | number) {
+  if (!dbPromise) initDB();
   const key = await getMasterKey();
   const iv = window.crypto.getRandomValues(new Uint8Array(12));
   const encoded = new TextEncoder().encode(JSON.stringify(item));
@@ -75,6 +76,7 @@ export async function saveEncrypted(storeName: 'identity' | 'sessions' | 'prekey
 }
 
 export async function loadEncrypted(storeName: 'identity' | 'sessions' | 'prekeys', idKey: string | number): Promise<any | null> {
+  if (!dbPromise) initDB();
   const db = await dbPromise;
   const record = await db.get(storeName, idKey as any);
   if (!record) return null;

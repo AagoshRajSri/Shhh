@@ -45,7 +45,8 @@ export class SignalService {
     );
     this.signingKeyPair = await window.crypto.subtle.exportKey('jwk', sigPair.privateKey);
 
-    this.registrationId = Math.floor(Math.random() * 16380) + 1;
+    const ridBytes = window.crypto.getRandomValues(new Uint8Array(2));
+    this.registrationId = ((ridBytes[0] << 8) | ridBytes[1]) % 16380 + 1;
 
     await saveEncrypted('identity', {
       privKey: this.identityKeyPair,
@@ -132,11 +133,11 @@ export class SignalService {
       identityKey: pubKeyB64,
       signedPreKey: {
         keyId: 1,
-        publicKey: pubKeyB64, // Just re-use identity for Phase 1
-        signature: 'mock-sig'
+        publicKey: pubKeyB64, // Re-uses identity key; replace with dedicated SignedPreKey in Phase 2
+        signature: 'not-yet-implemented'
       },
       preKeys: [],
-      kyberPreKey: 'base64-kyber-pub'
+      kyberPreKey: pubKeyB64 // Placeholder; replace with real Kyber-768 key in Phase 2
     };
   }
 
@@ -244,8 +245,13 @@ export class SignalService {
     }
   }
 
-  async decryptMessage(remoteHandle: string, ciphertext: string): Promise<any> {
-    console.log(`Decrypting message from ${remoteHandle}`);
+  /**
+   * Decrypts an incoming sealed envelope.
+   * @param expectedSender - If known (e.g. active chat), pass the handle to enforce strict identity binding.
+   *                         Pass null when the sender is not yet known (e.g. incoming WS message).
+   * @returns Decrypted payload. Always check `payload.from` after calling this.
+   */
+  async decryptMessage(expectedSender: string | null, ciphertext: string): Promise<any> {
     
     if (ciphertext.startsWith('ciphertext(ratchet_adv):')) {
       const b64 = ciphertext.split(':')[1];
@@ -298,8 +304,11 @@ export class SignalService {
       if (!claimedSender || !signatureB64) {
         throw new Error("Missing sender handle or signature. Authentication failed.");
       }
-      if (claimedSender !== remoteHandle) {
-        throw new Error(`CRITICAL: Identity mismatch! Message signed by ${claimedSender} but routed from ${remoteHandle}`);
+      // If we know who to expect (e.g. we initiated or are in an active chat), enforce binding.
+      // When expectedSender is null (unknown incoming message), we still verify the signature
+      // against the key fetched for claimedSender — forgery is still impossible.
+      if (expectedSender !== null && claimedSender !== expectedSender) {
+        throw new Error(`CRITICAL: Identity mismatch! Message signed by ${claimedSender} but routed from ${expectedSender}`);
       }
 
       // Fetch the claimed sender's public keys from the relay

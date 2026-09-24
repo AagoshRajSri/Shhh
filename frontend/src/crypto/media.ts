@@ -11,7 +11,7 @@ export async function computeFileHash(file: File | Blob): Promise<{ hex: string;
   // For simplicity and compatibility, we read the whole file. 
   // In a production app with very large files, we'd use a streaming WebAssembly hash.
   const buffer = await file.arrayBuffer();
-  const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+  const hashBuffer = await window.crypto.subtle.digest('SHA-256', buffer);
   const bytes = new Uint8Array(hashBuffer);
   const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
   return { hex, bytes };
@@ -67,7 +67,7 @@ export async function encryptMediaChunked(file: File): Promise<{
     offset += buf.length;
   }
   
-  const contentHashBuffer = await crypto.subtle.digest('SHA-256', fullCiphertext);
+  const contentHashBuffer = await window.crypto.subtle.digest('SHA-256', fullCiphertext);
   const contentHashHex = Array.from(new Uint8Array(contentHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 
   return {
