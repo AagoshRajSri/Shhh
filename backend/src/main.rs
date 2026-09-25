@@ -592,6 +592,7 @@ mod tests {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "redis://:CHANGEME@localhost:6379".to_string());
         let redis_client = redis::Client::open(redis_conn_string).expect("Invalid Redis URL");
+        let redis_conn = redis_client.get_multiplexed_async_connection().await.expect("Failed to connect to Redis");
 
         let s3_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .endpoint_url("http://localhost:9000")
@@ -606,7 +607,7 @@ mod tests {
 
         Arc::new(AppState {
             pool,
-            redis_client,
+            redis_conn,
             s3_client: s3::Client::from_conf(s3::config::Builder::from(&s3_config).force_path_style(true).build()),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             handle_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
