@@ -1,0 +1,10 @@
+# Gitleaks configuration for Shhh
+title = "Shhh Gitleaks Configuration"
+
+[allowlist]
+description = "Ignore mock test keys in test scripts"
+paths = [
+  '''frontend/load_test\.mjs''',
+  '''frontend/test_api\.mjs''',
+  '''frontend/test_crypto_audit\.ts'''
+]

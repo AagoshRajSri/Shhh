@@ -1,0 +1,5 @@
+# Gitleaks ignore file for false positives in historical commits
+2cd067c48c1ae928a0da2ccb09c00395f622951d:frontend/load_test.mjs:generic-api-key:28
+2cd067c48c1ae928a0da2ccb09c00395f622951d:frontend/load_test.mjs:generic-api-key:29
+2cd067c48c1ae928a0da2ccb09c00395f622951d:frontend/load_test.mjs:generic-api-key:31
+2cd067c48c1ae928a0da2ccb09c00395f622951d:frontend/test_api.mjs:generic-api-key:34

@@ -30,10 +30,10 @@ async function run() {
     const handle = `#test_${Date.now()}`;
     const body = {
         handle,
-        identity_public_key: 'dGVzdGtleQ==',
-        signed_prekey: 'dGVzdHNpZ25lZA==',
+        identity_public_key: Buffer.from('testkey').toString('base64'), // gitleaks:allow
+        signed_prekey: Buffer.from('testsigned').toString('base64'), // gitleaks:allow
         one_time_prekeys: [],
-        kyber_public_key: 'a3liZXI='
+        kyber_public_key: Buffer.from('kyber').toString('base64') // gitleaks:allow
     };
     let routingToken;
 

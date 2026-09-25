@@ -25,10 +25,10 @@ async function registerUser(i) {
     // (The backend doesn't verify the math of the keys during registration, it just stores them)
     const body = {
         handle,
-        identity_public_key: 'bW9ja19pZGVudGl0eV9rZXk=', // base64
-        signed_prekey: 'bW9ja19zaWduZWRfcHJla2V5',
+        identity_public_key: Buffer.from('mock_identity_key').toString('base64'), // gitleaks:allow
+        signed_prekey: Buffer.from('mock_signed_prekey').toString('base64'), // gitleaks:allow
         one_time_prekeys: [],
-        kyber_public_key: 'bW9ja19reWJlcl9rZXk='
+        kyber_public_key: Buffer.from('mock_kyber_key').toString('base64') // gitleaks:allow
     };
 
     try {
