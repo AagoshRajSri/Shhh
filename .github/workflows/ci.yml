@@ -10,6 +10,29 @@ jobs:
   rust-checks:
     name: Rust Backend Checks
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: securechat
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: securechat
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     defaults:
       run:
         working-directory: ./backend
@@ -22,6 +45,9 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Run tests
+        env:
+          DATABASE_URL: postgres://securechat:password@localhost:5432/securechat
+          REDIS_URL: redis://localhost:6379
         run: cargo test
 
   frontend-checks:

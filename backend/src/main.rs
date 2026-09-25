@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{info, error};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use base64::{Engine as _, engine::general_purpose::STANDARD as b64};
 use chrono::Utc;
 use axum::extract::ConnectInfo;
@@ -195,22 +195,23 @@ async fn register_handler(
     let kyber_pubkey_bytes = b64.decode(&payload.kyber_public_key).unwrap_or_default();
     let now = Utc::now().naive_utc().date();
 
-    let result = sqlx::query!(
+    let result = sqlx::query(
         "INSERT INTO users (handle, identity_pubkey, signed_prekey, kyber_pubkey, created_week)
          VALUES ($1, $2, $3, $4, $5)
          RETURNING id",
-        payload.handle,
-        id_pubkey_bytes,
-        signed_prekey_bytes,
-        kyber_pubkey_bytes,
-        now
     )
+    .bind(&payload.handle)
+    .bind(&id_pubkey_bytes)
+    .bind(&signed_prekey_bytes)
+    .bind(&kyber_pubkey_bytes)
+    .bind(now)
     .fetch_one(&state.pool)
     .await;
 
     match result {
         Ok(record) => {
-            let routing_token = record.id.to_string();
+            let id: uuid::Uuid = record.try_get("id").unwrap_or_default();
+            let routing_token = id.to_string();
             Ok(Json(RegisterResponse {
                 status: "success".to_string(),
                 routing_token,
@@ -259,19 +260,21 @@ async fn lookup_handler(
         entry.0 += 1;
     }
 
-    let result = sqlx::query!(
+    let result = sqlx::query(
         "SELECT id, identity_pubkey FROM users WHERE handle = $1",
-        handle
     )
+    .bind(&handle)
     .fetch_optional(&state.pool)
     .await;
 
     match result {
         Ok(Some(record)) => {
+            let id: uuid::Uuid = record.try_get("id").unwrap_or_default();
+            let identity_pubkey: Vec<u8> = record.try_get("identity_pubkey").unwrap_or_default();
             Ok(Json(LookupResponse {
                 status: "success".to_string(),
-                routing_token: record.id.to_string(),
-                identity_pubkey: b64.encode(&record.identity_pubkey),
+                routing_token: id.to_string(),
+                identity_pubkey: b64.encode(&identity_pubkey),
             }))
         }
         _ => {
@@ -566,7 +569,9 @@ mod tests {
     async fn setup_test_state() -> Arc<AppState> {
         dotenvy::dotenv().ok();
         let db_conn_string = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://securechat:CHANGEME@localhost:5432/securechat".to_string());
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "postgres://securechat:CHANGEME@localhost:5432/securechat".to_string());
         let pool = PgPool::connect(&db_conn_string).await.expect("Failed to connect to Postgres");
         
         sqlx::migrate!("./migrations")
@@ -575,7 +580,9 @@ mod tests {
             .expect("Failed to run migrations");
 
         let redis_conn_string = std::env::var("REDIS_URL")
-            .unwrap_or_else(|_| "redis://:CHANGEME@localhost:6379".to_string());
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "redis://:CHANGEME@localhost:6379".to_string());
         let redis_client = redis::Client::open(redis_conn_string).expect("Invalid Redis URL");
 
         let s3_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
