@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Send, Sun, Moon, ShieldAlert, FileText, Check, X, AlertTriangle } from 'lucide-react';
+import { Send, Sun, Moon, ShieldAlert, FileText, Check, X, AlertTriangle, Plus, Image as ImageIcon, Video } from 'lucide-react';
 import { initDB, saveEncrypted } from './crypto/db';
 import { signalService } from './crypto/signal';
 import { wsService } from './network/ws';
@@ -35,6 +35,8 @@ export default function App() {
   const [contacts, setContacts] = useState<string[]>([]);
   const [pendingRequests, setPendingRequests] = useState<{from: string, text: string}[]>([]);
   const [isUploading, setIsUploading] = useState(false);
+  const [showAttachmentMenu, setShowAttachmentMenu] = useState(false);
+  const attachmentMenuRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [safetyNumber, setSafetyNumber] = useState<string | null>(null);
@@ -43,6 +45,18 @@ export default function App() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (attachmentMenuRef.current && !attachmentMenuRef.current.contains(event.target as Node)) {
+        setShowAttachmentMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, []);
 
   const [isInitializing, setIsInitializing] = useState(false);
 
@@ -262,7 +276,10 @@ export default function App() {
   };
 
   const uploadAndSendFile = async (file: File) => {
-    if (!activeChat) return;
+    if (!activeChat) {
+      setErrorMsg('Please start a conversation first by typing #username');
+      return;
+    }
     setIsUploading(true);
     try {
       // 1. Client-side Convergent Encryption (ChaCha20-Poly1305)
@@ -680,15 +697,58 @@ export default function App() {
                   }
                 }}
               />
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                disabled={!activeChat || isUploading}
-                className="mr-3 shrink-0 p-2 text-zinc-500 hover:text-zinc-300 transition-colors"
-                title="Attach secure file"
-              >
-                <FileText size={18} />
-              </button>
+              <div className="relative flex items-center" ref={attachmentMenuRef}>
+                <button
+                  type="button"
+                  onClick={() => setShowAttachmentMenu(!showAttachmentMenu)}
+                  disabled={isUploading}
+                  className={`mr-3 shrink-0 p-2 rounded-full transition-all duration-300 flex items-center justify-center ${
+                    showAttachmentMenu 
+                      ? (lightMode ? 'bg-zinc-200 text-black rotate-45' : 'bg-zinc-700 text-white rotate-45') 
+                      : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30'
+                  } ${isUploading ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  title="Attach secure file"
+                >
+                  <Plus size={18} />
+                </button>
+                
+                {showAttachmentMenu && (
+                  <div className={`absolute bottom-full mb-4 left-0 flex flex-col gap-1 p-2 rounded-2xl shadow-2xl border animate-in slide-in-from-bottom-2 fade-in duration-200 z-50 min-w-[160px] ${
+                    lightMode ? 'bg-white border-zinc-200' : 'bg-[#1a1a1a] border-[#2a2a2a]'
+                  }`}>
+                    <button
+                      type="button"
+                      onClick={() => { if(fileInputRef.current) fileInputRef.current.accept = 'image/*'; fileInputRef.current?.click(); setShowAttachmentMenu(false); }}
+                      className={`flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+                        lightMode ? 'hover:bg-zinc-100 text-zinc-700' : 'hover:bg-zinc-800/70 text-zinc-300'
+                      }`}
+                    >
+                      <ImageIcon size={16} className="text-blue-500" />
+                      Images
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => { if(fileInputRef.current) fileInputRef.current.accept = 'video/*'; fileInputRef.current?.click(); setShowAttachmentMenu(false); }}
+                      className={`flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+                        lightMode ? 'hover:bg-zinc-100 text-zinc-700' : 'hover:bg-zinc-800/70 text-zinc-300'
+                      }`}
+                    >
+                      <Video size={16} className="text-purple-500" />
+                      Videos
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => { if(fileInputRef.current) fileInputRef.current.accept = '*/*'; fileInputRef.current?.click(); setShowAttachmentMenu(false); }}
+                      className={`flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+                        lightMode ? 'hover:bg-zinc-100 text-zinc-700' : 'hover:bg-zinc-800/70 text-zinc-300'
+                      }`}
+                    >
+                      <FileText size={16} className="text-orange-500" />
+                      Documents
+                    </button>
+                  </div>
+                )}
+              </div>
 
               <input
                 type="text"
