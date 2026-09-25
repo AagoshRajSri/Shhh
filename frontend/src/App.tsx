@@ -21,6 +21,8 @@ type Message = {
   };
 };
 
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [activeChat, setActiveChat] = useState<string | null>(null);
@@ -67,30 +69,55 @@ export default function App() {
       identityBundle = await signalService.generatePreKeyBundle(); // Re-generate bundle for registration
     }
     
-    // Perform backend registration
+    let routingToken = null;
+
     try {
-      const response = await fetch('http://localhost:3000/api/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          handle: cleanHandle,
-          identity_public_key: identityBundle.identityKey,
-          signed_prekey: identityBundle.signedPreKey.publicKey,
-          one_time_prekeys: identityBundle.preKeys.map((pk: any) => pk.publicKey),
-          kyber_public_key: identityBundle.kyberPreKey
-        })
-      });
-      
-      const data = await response.json();
-      
-      if (data.status === 'success') {
-        // Connect WebSocket using the returned routing token
-        wsService.connect(data.routing_token);
+      if (!hasIdentity) {
+        const response = await fetch('${API_URL}/api/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            handle: cleanHandle,
+            identity_public_key: identityBundle.identityKey,
+            signed_prekey: identityBundle.signedPreKey.publicKey,
+            one_time_prekeys: identityBundle.preKeys.map((pk: any) => pk.publicKey),
+            kyber_public_key: identityBundle.kyberPreKey
+          })
+        });
+        
+        if (response.status === 409) {
+          throw new Error("Username already taken. Please choose a different username.");
+        }
+
+        if (!response.ok) {
+          throw new Error(`Registration failed: ${response.status}`);
+        }
+
+        const data = await response.json();
+        routingToken = data.routing_token;
       } else {
-        throw new Error("Registration failed");
+        // User already has a local identity. Lookup their own routing token.
+        const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(cleanHandle)}`);
+        if (res.status === 429) {
+          throw new Error("Too many requests. Please wait a moment.");
+        }
+        if (!res.ok) {
+          throw new Error(`Failed to lookup existing user: ${res.status}`);
+        }
+        const data = await res.json();
+        routingToken = data.routing_token;
       }
-    } catch (err) {
-      console.warn("Backend not running, falling back to mock routing token for dev", err);
+
+      if (routingToken) {
+        wsService.connect(routingToken);
+      }
+    } catch (err: any) {
+      console.warn("Backend error, falling back to mock routing token for dev", err);
+      if (err.message && err.message.includes("already taken")) {
+        alert(err.message + "\n\n(If this was your account but you cleared your browser data, your keys are lost and you must choose a new username).");
+        setIsInitializing(false);
+        return;
+      }
       wsService.connect('my-mock-routing-token');
     }
     
@@ -156,14 +183,14 @@ export default function App() {
     }
 
     // 2. Not Self
-    if (targetHandle === handle) {
+    if (targetHandle.toLowerCase() === handle.toLowerCase()) {
       setErrorMsg('You cannot send a message to yourself.');
       return;
     }
 
     // 3. Exists in Database & Get Routing Token
     try {
-      const res = await fetch(`http://localhost:3000/api/lookup/${encodeURIComponent(targetHandle)}`);
+      const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(targetHandle)}`);
       const data = await res.json();
       
       if (data.status !== 'success' || !data.routing_token) {
@@ -243,7 +270,7 @@ export default function App() {
       const keyHex = Array.from(key).map(b => b.toString(16).padStart(2, '0')).join('');
       
       // 2. Initialize S3 Multipart Upload
-      const initRes = await fetch('http://localhost:3000/api/upload/init', {
+      const initRes = await fetch('${API_URL}/api/upload/init', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ hash: contentHash, parts: chunks.length })
@@ -263,7 +290,7 @@ export default function App() {
         }
         
         // Complete the multipart upload
-        await fetch('http://localhost:3000/api/upload/complete', {
+        await fetch('${API_URL}/api/upload/complete', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ hash: contentHash, upload_id: initData.upload_id, etags })
@@ -285,7 +312,7 @@ export default function App() {
         attachment
       };
       
-      const res = await fetch(`http://localhost:3000/api/lookup/${encodeURIComponent(activeChat)}`);
+      const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(activeChat)}`);
       const data = await res.json();
       if (data.status === 'success' && data.routing_token) {
         if (await signalService.checkKeyChange(activeChat, data.identity_pubkey)) {
@@ -325,7 +352,7 @@ export default function App() {
 
     // Notify sender that their request was accepted
     try {
-      const res = await fetch(`http://localhost:3000/api/lookup/${encodeURIComponent(from)}`);
+      const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(from)}`);
       const data = await res.json();
       if (data.status === 'success' && data.routing_token) {
         const payload = {
@@ -364,7 +391,7 @@ export default function App() {
   const handleDownload = async (msg: Message) => {
     if (!msg.attachment) return;
     try {
-      const res = await fetch(`http://localhost:3000/api/download/${msg.attachment.hash}`);
+      const res = await fetch(`${API_URL}/api/download/${msg.attachment.hash}`);
       const data = await res.json();
       if (!data.url) throw new Error("No download URL returned");
       
@@ -389,7 +416,7 @@ export default function App() {
   const verifySafetyNumber = async () => {
     if (!activeChat) return;
     try {
-      const res = await fetch(`http://localhost:3000/api/lookup/${encodeURIComponent(activeChat)}`);
+      const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(activeChat)}`);
       const data = await res.json();
       if (data.status === 'success' && data.identity_pubkey) {
         const sn = await signalService.computeSafetyNumber(data.identity_pubkey);
@@ -416,7 +443,7 @@ export default function App() {
         <div className="flex h-screen w-full">
             <div className="w-full hidden md:inline-block relative">
                 <div className={`absolute inset-0 ${lightMode ? 'bg-black/5' : 'bg-black/60'} pointer-events-none z-10`} />
-                <img className="h-full w-full object-cover" src="https://raw.githubusercontent.com/prebuiltui/prebuiltui/main/assets/login/leftSideImage.png" alt="leftSideImage" />
+                <img className="h-full w-full object-cover" src="/login-banner.png" alt="leftSideImage" />
             </div>
         
             <div className={`w-full flex flex-col items-center justify-center ${lightMode ? 'bg-white' : 'bg-black'}`}>
@@ -666,6 +693,11 @@ export default function App() {
               <input
                 type="text"
                 value={inputValue}
+                onKeyDown={(e) => {
+                  if (e.key === 'Backspace' && inputValue === '') {
+                    setActiveChat(null);
+                  }
+                }}
                 onChange={(e) => {
                   setInputValue(e.target.value);
                   setErrorMsg('');

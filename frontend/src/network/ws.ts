@@ -10,12 +10,12 @@ export class WSService {
     if (this.ws?.readyState === WebSocket.OPEN || this.isConnecting) return;
     this.isConnecting = true;
 
-    // Use ws://localhost:3000 for local dev
-    const url = `ws://localhost:3000/ws`;
-    console.log(`Connecting to Relay via WebSocket: ${url}`);
+    // Use dynamic WS URL from environment or fallback to localhost
+    const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3000/ws';
+    console.log(`Connecting to Relay via WebSocket: ${WS_URL}`);
     
     // Pass routing token as a subprotocol to avoid leaking it in URLs
-    this.ws = new WebSocket(url, [routingToken]);
+    this.ws = new WebSocket(WS_URL, [routingToken]);
 
     this.ws.onopen = () => {
       this.isConnecting = false;

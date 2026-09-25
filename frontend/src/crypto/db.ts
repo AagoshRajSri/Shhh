@@ -59,9 +59,32 @@ let masterKey: CryptoKey | null = null;
 
 export async function getMasterKey(): Promise<CryptoKey> {
   if (masterKey) return masterKey;
-  masterKey = await window.crypto.subtle.generateKey(
-    { name: 'AES-GCM', length: 256 },
-    true,
+
+  const storageKey = 'shhh_local_device_key';
+  let rawB64 = localStorage.getItem(storageKey);
+  let rawBytes: Uint8Array;
+
+  if (!rawB64) {
+    rawBytes = window.crypto.getRandomValues(new Uint8Array(32));
+    localStorage.setItem(storageKey, btoa(String.fromCharCode(...rawBytes)));
+  } else {
+    try {
+      const binStr = atob(rawB64);
+      rawBytes = new Uint8Array(binStr.length);
+      for (let i = 0; i < binStr.length; i++) {
+        rawBytes[i] = binStr.charCodeAt(i);
+      }
+    } catch {
+      rawBytes = window.crypto.getRandomValues(new Uint8Array(32));
+      localStorage.setItem(storageKey, btoa(String.fromCharCode(...rawBytes)));
+    }
+  }
+
+  masterKey = await window.crypto.subtle.importKey(
+    'raw',
+    rawBytes as any,
+    { name: 'AES-GCM' },
+    false,
     ['encrypt', 'decrypt']
   );
   return masterKey;
@@ -105,7 +128,12 @@ export async function loadEncrypted(storeName: 'identity' | 'sessions' | 'prekey
     );
     return JSON.parse(new TextDecoder().decode(decrypted));
   } catch (e) {
-    console.error('Failed to decrypt local DB record', e);
+    console.warn(`Local record in ${storeName} could not be decrypted. Resetting obsolete record.`);
+    try {
+      await db.delete(storeName, idKey as any);
+    } catch {
+      // ignore
+    }
     return null;
   }
 }

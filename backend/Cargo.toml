@@ -23,6 +23,7 @@ rcgen = "0.14.10"
 aws-config = "1.12.0"
 aws-sdk-s3 = "1.149.0"
 dotenvy = "0.15.7"
+thiserror = "2.0.21"
 
 [profile.dev]
 codegen-units = 1

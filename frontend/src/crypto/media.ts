@@ -1,19 +1,27 @@
 import { chacha20poly1305 } from '@noble/ciphers/chacha.js';
+import { createSHA256 } from 'hash-wasm';
 
 // Chunk size for multipart uploads (5MB)
 export const CHUNK_SIZE = 5 * 1024 * 1024; 
 
 /**
- * Computes a SHA-256 hash incrementally or via ArrayBuffer if streaming isn't natively supported.
+ * Computes a SHA-256 hash incrementally via streaming WebAssembly.
  * Returns the hash as a hex string and raw bytes.
  */
 export async function computeFileHash(file: File | Blob): Promise<{ hex: string; bytes: Uint8Array }> {
-  // For simplicity and compatibility, we read the whole file. 
-  // In a production app with very large files, we'd use a streaming WebAssembly hash.
-  const buffer = await file.arrayBuffer();
-  const hashBuffer = await window.crypto.subtle.digest('SHA-256', buffer);
-  const bytes = new Uint8Array(hashBuffer);
-  const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  const hasher = await createSHA256();
+  hasher.init();
+
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, file.size);
+    const chunkBuffer = await file.slice(start, end).arrayBuffer();
+    hasher.update(new Uint8Array(chunkBuffer));
+  }
+
+  const hex = hasher.digest('hex');
+  const bytes = new Uint8Array(hex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
   return { hex, bytes };
 }
 
@@ -32,43 +40,28 @@ export async function encryptMediaChunked(file: File): Promise<{
   
   const chunks: Blob[] = [];
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-  let ciphertextLength = 0;
   
-  // We need to hash the ciphertext to get the contentHash
-  // We'll collect all encrypted chunks to hash them at the end.
-  const encryptedBuffers: Uint8Array[] = [];
+  const ciphertextHasher = await createSHA256();
+  ciphertextHasher.init();
 
   for (let i = 0; i < totalChunks; i++) {
     const start = i * CHUNK_SIZE;
     const end = Math.min(start + CHUNK_SIZE, file.size);
-    const chunkBlob = file.slice(start, end);
-    const chunkBuffer = await chunkBlob.arrayBuffer();
+    const chunkBuffer = await file.slice(start, end).arrayBuffer();
     
-    // Construct nonce for this chunk: baseNonce + chunk index in last 4 bytes
+    // Construct nonce for this chunk: chunk index in last 4 bytes (little endian)
     const chunkNonce = new Uint8Array(12);
     const view = new DataView(chunkNonce.buffer);
-    view.setUint32(8, i, true); // Little endian
+    view.setUint32(8, i, true);
 
     const cipher = chacha20poly1305(key, chunkNonce);
     const encryptedChunk = cipher.encrypt(new Uint8Array(chunkBuffer));
     
-    // Prefix with chunk index + length for robust decryption, or just rely on sequence.
-    // For simplicity, we just store the encrypted bytes. The Poly1305 tag is appended by the cipher.
+    ciphertextHasher.update(encryptedChunk);
     chunks.push(new Blob([encryptedChunk]));
-    encryptedBuffers.push(encryptedChunk);
-    ciphertextLength += encryptedChunk.length;
   }
 
-  // Hash the concatenated ciphertext to get the content address
-  const fullCiphertext = new Uint8Array(ciphertextLength);
-  let offset = 0;
-  for (const buf of encryptedBuffers) {
-    fullCiphertext.set(buf, offset);
-    offset += buf.length;
-  }
-  
-  const contentHashBuffer = await window.crypto.subtle.digest('SHA-256', fullCiphertext);
-  const contentHashHex = Array.from(new Uint8Array(contentHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+  const contentHashHex = ciphertextHasher.digest('hex');
 
   return {
     chunks,
@@ -90,8 +83,7 @@ export async function decryptMediaChunked(ciphertextBlob: Blob, key: Uint8Array,
   for (let i = 0; i < totalChunks; i++) {
     const start = i * ENCRYPTED_CHUNK_SIZE;
     const end = Math.min(start + ENCRYPTED_CHUNK_SIZE, ciphertextBlob.size);
-    const chunkBlob = ciphertextBlob.slice(start, end);
-    const chunkBuffer = await chunkBlob.arrayBuffer();
+    const chunkBuffer = await ciphertextBlob.slice(start, end).arrayBuffer();
     
     const chunkNonce = new Uint8Array(12);
     const view = new DataView(chunkNonce.buffer);

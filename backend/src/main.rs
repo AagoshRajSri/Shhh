@@ -59,7 +59,7 @@ struct WsQuery {
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
-    redis_client: redis::Client,
+    redis_conn: redis::aio::MultiplexedConnection,
     s3_client: s3::Client,
     active_connections: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
     handle_rate_limiter: HandleRateLimiter,
@@ -110,6 +110,7 @@ async fn main() {
     let redis_conn_string = std::env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://:CHANGEME@localhost:6379".to_string());
     let redis_client = redis::Client::open(redis_conn_string).expect("Invalid Redis URL");
+    let redis_conn = redis_client.get_multiplexed_async_connection().await.expect("Failed to connect to Redis");
 
     println!("Connecting to MinIO...");
     let s3_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -136,7 +137,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         pool,
-        redis_client,
+        redis_conn,
         s3_client,
         active_connections: Arc::new(Mutex::new(HashMap::new())),
         handle_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
@@ -311,20 +312,15 @@ async fn message_handler(
     let msg_id = uuid::Uuid::new_v4().to_string();
     let queue_key = format!("queue:{}", envelope.to_routing_token);
     
-    match state.redis_client.get_multiplexed_async_connection().await {
-        Ok(mut conn) => {
-            let res: Result<(), _> = redis::pipe()
-                .hset(&queue_key, &msg_id, &envelope.encrypted_payload)
-                .expire(&queue_key, 604800)
-                .ignore()
-                .query_async(&mut conn).await;
-            if let Err(e) = res {
-                error!("Redis pipe error in /api/message: {:?}", e);
-            }
-        }
-        Err(e) => {
-            error!("Redis connection error in /api/message: {:?}", e);
-        }
+    let mut conn = state.redis_conn.clone();
+    let res: Result<(), _> = redis::pipe()
+        .hset(&queue_key, &msg_id, &envelope.encrypted_payload)
+        .expire(&queue_key, 604800)
+        .ignore()
+        .query_async(&mut conn).await;
+    
+    if let Err(e) = res {
+        error!("Redis pipe error in /api/message: {:?}", e);
     }
     
     let conns = state.active_connections.lock().await;
@@ -353,19 +349,17 @@ async fn ws_handler(
     ws.protocols([token.clone()]).on_upgrade(move |socket| handle_socket(socket, token, state))
 }
 
-async fn flush_queue(token: &str, socket: &mut WebSocket, redis_client: &redis::Client) -> bool {
-    if let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await {
-        let queue_key = format!("queue:{}", token);
-        let query_result: Result<HashMap<String, String>, _> = redis::cmd("HGETALL").arg(&queue_key).query_async(&mut conn).await;
-        if let Ok(items) = query_result {
-            for (msg_id, payload) in items {
-                let ws_msg = serde_json::json!({
-                    "msg_id": msg_id,
-                    "encrypted_payload": payload
-                });
-                if socket.send(WsMessage::Text(serde_json::to_string(&ws_msg).unwrap())).await.is_err() {
-                    return false;
-                }
+async fn flush_queue(token: &str, socket: &mut WebSocket, mut redis_conn: redis::aio::MultiplexedConnection) -> bool {
+    let queue_key = format!("queue:{}", token);
+    let query_result: Result<HashMap<String, String>, _> = redis::cmd("HGETALL").arg(&queue_key).query_async(&mut redis_conn).await;
+    if let Ok(items) = query_result {
+        for (msg_id, payload) in items {
+            let ws_msg = serde_json::json!({
+                "msg_id": msg_id,
+                "encrypted_payload": payload
+            });
+            if socket.send(WsMessage::Text(serde_json::to_string(&ws_msg).unwrap())).await.is_err() {
+                return false;
             }
         }
     }
@@ -383,57 +377,71 @@ async fn handle_socket(mut socket: WebSocket, token: String, state: Arc<AppState
     info!("WS Connected successfully for token: {}", token);
     
     // Flush immediately on connect
-    if !flush_queue(&token, &mut socket, &state.redis_client).await {
+    if !flush_queue(&token, &mut socket, state.redis_conn.clone()).await {
         return;
     }
 
     loop {
         tokio::select! {
-            Ok(msg) = rx.recv() => {
-                if msg == "WAKE" {
-                    if !flush_queue(&token, &mut socket, &state.redis_client).await {
+            result = rx.recv() => {
+                match result {
+                    Ok(msg) => {
+                        if msg == "WAKE" {
+                            if !flush_queue(&token, &mut socket, state.redis_conn.clone()).await {
+                                break;
+                            }
+                        } else {
+                            if socket.send(WsMessage::Text(msg)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         break;
                     }
-                } else {
-                    // Legacy text message relay support
-                    if socket.send(WsMessage::Text(msg)).await.is_err() {
-                        break;
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Just missed some WAKE messages, flush queue anyway
+                        if !flush_queue(&token, &mut socket, state.redis_conn.clone()).await {
+                            break;
+                        }
                     }
                 }
             }
             
-            Some(msg) = socket.recv() => {
-                if let Ok(WsMessage::Text(text)) = msg {
-                    if let Ok(envelope) = serde_json::from_str::<SealedSenderEnvelope>(&text) {
-                        info!("Routing WS message to: {}", envelope.to_routing_token);
-                        
-                        let msg_id = uuid::Uuid::new_v4().to_string();
-                        let queue_key = format!("queue:{}", envelope.to_routing_token);
-                        
-                        if let Ok(mut conn) = state.redis_client.get_multiplexed_async_connection().await {
+            result = socket.recv() => {
+                match result {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        if let Ok(envelope) = serde_json::from_str::<SealedSenderEnvelope>(&text) {
+                            info!("Routing WS message to: {}", envelope.to_routing_token);
+                            
+                            let msg_id = uuid::Uuid::new_v4().to_string();
+                            let queue_key = format!("queue:{}", envelope.to_routing_token);
+                            
+                            let mut conn = state.redis_conn.clone();
                             let _: () = redis::pipe()
                                 .hset(&queue_key, &msg_id, &envelope.encrypted_payload)
                                 .expire(&queue_key, 604800)
                                 .ignore()
                                 .query_async(&mut conn).await.unwrap_or(());
-                        }
 
-                        let conns = state.active_connections.lock().await;
-                        if let Some(tx) = conns.get(&envelope.to_routing_token) {
-                            let _ = tx.send("WAKE".to_string());
-                        }
-                    } else if let Ok(ack) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if ack["type"] == "ack" {
-                            if let Some(msg_id) = ack["msg_id"].as_str() {
-                                let queue_key = format!("queue:{}", token);
-                                if let Ok(mut conn) = state.redis_client.get_multiplexed_async_connection().await {
+                            let conns = state.active_connections.lock().await;
+                            if let Some(tx) = conns.get(&envelope.to_routing_token) {
+                                let _ = tx.send("WAKE".to_string());
+                            }
+                        } else if let Ok(ack) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if ack["type"] == "ack" {
+                                if let Some(msg_id) = ack["msg_id"].as_str() {
+                                    let queue_key = format!("queue:{}", token);
+                                    let mut conn = state.redis_conn.clone();
                                     let _: () = redis::cmd("HDEL").arg(&queue_key).arg(msg_id).query_async(&mut conn).await.unwrap_or(());
                                 }
                             }
                         }
                     }
-                } else if msg.is_err() {
-                    break;
+                    Some(Err(_)) | None => {
+                        break;
+                    }
+                    _ => {} // Ignore other message types (Ping, Pong, Binary)
                 }
             }
         }
