@@ -98,14 +98,16 @@ export class SignalService {
 
   async computeSafetyNumber(remoteIdentityKeyB64: string): Promise<string> {
     const myKeys = await this.getPublicKeyJWK();
-    const myPubX = myKeys.pubJWK.x;
-    const mySigX = myKeys.sigJWK.x;
-    const myFingerprint = myPubX + mySigX;
+    const myPub = myKeys.pubJWK.x + (myKeys.pubJWK.y || '');
+    const mySig = myKeys.sigJWK.x + (myKeys.sigJWK.y || '');
+    const myFingerprint = myPub + mySig;
 
     const remoteKeys = JSON.parse(atob(remoteIdentityKeyB64));
-    const remotePubX = (remoteKeys.pubJWK || remoteKeys).x;
-    const remoteSigX = remoteKeys.sigJWK ? remoteKeys.sigJWK.x : '';
-    const remoteFingerprint = remotePubX + remoteSigX;
+    const remotePubJWK = remoteKeys.pubJWK || remoteKeys;
+    const remoteSigJWK = remoteKeys.sigJWK || {};
+    const remotePub = remotePubJWK.x + (remotePubJWK.y || '');
+    const remoteSig = (remoteSigJWK.x || '') + (remoteSigJWK.y || '');
+    const remoteFingerprint = remotePub + remoteSig;
 
     // Sort so both parties compute the exact same string
     const sorted = [myFingerprint, remoteFingerprint].sort();
@@ -121,6 +123,18 @@ export class SignalService {
         numStr += val.toString().padStart(5, '0');
     }
     return numStr.substring(0, 60).match(/.{5}/g)?.join(' ') || numStr;
+  }
+
+  async checkKeyChange(handle: string, remoteIdentityKeyB64: string): Promise<boolean> {
+    const stored = await loadEncrypted('knownKeys', handle);
+    if (!stored || !stored.keyB64) {
+      await saveEncrypted('knownKeys', { handle, keyB64: remoteIdentityKeyB64 }, handle);
+      return false;
+    }
+    if (stored.keyB64 !== remoteIdentityKeyB64) {
+      return true; // Key has changed!
+    }
+    return false;
   }
 
   async generatePreKeyBundle() {

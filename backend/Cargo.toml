@@ -2,6 +2,7 @@
 name = "securechat-backend"
 version = "0.1.0"
 edition = "2021"
+default-run = "securechat-backend"
 
 [dependencies]
 axum = { version = "0.7.4", features = ["ws"] }

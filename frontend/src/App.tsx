@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
-import { Send, Sun, Moon, ShieldAlert, FileText, Check, X } from 'lucide-react';
-import { initDB } from './crypto/db';
+import { Send, Sun, Moon, ShieldAlert, FileText, Check, X, AlertTriangle } from 'lucide-react';
+import { initDB, saveEncrypted } from './crypto/db';
 import { signalService } from './crypto/signal';
 import { wsService } from './network/ws';
 import { encryptMediaChunked, decryptMediaChunked } from './crypto/media';
@@ -36,6 +36,7 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [safetyNumber, setSafetyNumber] = useState<string | null>(null);
+  const [keyChangeWarning, setKeyChangeWarning] = useState<{message: string, handle: string, pubkey: string} | null>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -171,6 +172,14 @@ export default function App() {
       }
       
       const to_routing_token = data.routing_token;
+
+      if (await signalService.checkKeyChange(targetHandle, data.identity_pubkey)) {
+        setKeyChangeWarning({
+          message: `WARNING: The security keys for ${targetHandle} have changed! This could mean they re-registered, or it could be a man-in-the-middle attack. Verify safety numbers!`,
+          handle: targetHandle,
+          pubkey: data.identity_pubkey
+        });
+      }
       
       // 4. Contact Request vs Message
       const isContact = contacts.includes(targetHandle);
@@ -279,6 +288,9 @@ export default function App() {
       const res = await fetch(`http://localhost:3000/api/lookup/${encodeURIComponent(activeChat)}`);
       const data = await res.json();
       if (data.status === 'success' && data.routing_token) {
+        if (await signalService.checkKeyChange(activeChat, data.identity_pubkey)) {
+          alert(`WARNING: The security keys for ${activeChat} have changed! This could mean they re-registered, or it could be a man-in-the-middle attack. Verify safety numbers!`);
+        }
         const encrypted_payload = await signalService.encryptMessage(activeChat, data.identity_pubkey, payload);
         wsService.send({
           to_routing_token: data.routing_token,
@@ -423,6 +435,13 @@ export default function App() {
                         <div className={`w-full h-px ${lightMode ? 'bg-gray-300' : 'bg-zinc-800'}`}></div>
                         <p className={`w-full text-nowrap text-xs font-mono tracking-widest uppercase ${lightMode ? 'text-gray-500' : 'text-zinc-500'}`}>Generate Keys</p>
                         <div className={`w-full h-px ${lightMode ? 'bg-gray-300' : 'bg-zinc-800'}`}></div>
+                    </div>
+
+                    <div className={`mb-6 p-4 rounded-xl border flex items-start gap-3 ${lightMode ? 'bg-red-50 border-red-200 text-red-800' : 'bg-red-950/30 border-red-900/50 text-red-200'}`}>
+                        <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
+                        <div className="text-xs leading-relaxed">
+                            <strong>Permanent Data Loss Warning:</strong> There is no account recovery. If you lose this device or clear your browser data, your identity and all conversations will be permanently lost.
+                        </div>
                     </div>
         
                     <div className={`flex items-center w-full bg-transparent border ${lightMode ? 'border-gray-300' : 'border-zinc-800'} h-12 rounded-full overflow-hidden pl-6 gap-2 focus-within:border-zinc-500 transition-colors`}>
@@ -678,6 +697,30 @@ export default function App() {
         </div>
 
       </div>
+
+      {keyChangeWarning && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className={`p-6 max-w-sm rounded-2xl shadow-2xl border ${lightMode ? 'bg-white border-red-200' : 'bg-neutral-900 border-red-900'}`}>
+            <div className="flex items-center space-x-3 text-red-500 mb-4">
+              <ShieldAlert className="w-8 h-8" />
+              <h3 className="text-xl font-bold">Security Alert</h3>
+            </div>
+            <p className={`text-sm mb-6 ${lightMode ? 'text-neutral-700' : 'text-neutral-300'}`}>
+              {keyChangeWarning.message}
+            </p>
+            <button 
+              onClick={async () => {
+                await saveEncrypted('knownKeys', { handle: keyChangeWarning.handle, keyB64: keyChangeWarning.pubkey }, keyChangeWarning.handle);
+                setKeyChangeWarning(null);
+              }}
+              className="w-full py-3 rounded-lg font-bold transition-all bg-red-600 hover:bg-red-700 text-white"
+            >
+              I Understand
+            </button>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }

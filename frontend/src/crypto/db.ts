@@ -26,16 +26,29 @@ interface SecureChatDB extends DBSchema {
       iv: Uint8Array;
     };
   };
+  knownKeys: {
+    key: string;
+    value: {
+      address: string;
+      encryptedRecord: ArrayBuffer;
+      iv: Uint8Array;
+    };
+  };
 }
 
 let dbPromise: Promise<IDBPDatabase<SecureChatDB>>;
 
 export function initDB() {
-  dbPromise = openDB<SecureChatDB>('securechat-db', 1, {
-    upgrade(db) {
-      db.createObjectStore('identity', { keyPath: 'id' });
-      db.createObjectStore('sessions', { keyPath: 'address' });
-      db.createObjectStore('prekeys', { keyPath: 'id' });
+  dbPromise = openDB<SecureChatDB>('securechat-db', 2, {
+    upgrade(db, oldVersion) {
+      if (oldVersion < 1) {
+        db.createObjectStore('identity', { keyPath: 'id' });
+        db.createObjectStore('sessions', { keyPath: 'address' });
+        db.createObjectStore('prekeys', { keyPath: 'id' });
+      }
+      if (oldVersion < 2) {
+        db.createObjectStore('knownKeys', { keyPath: 'address' });
+      }
     },
   });
 }
@@ -54,7 +67,7 @@ export async function getMasterKey(): Promise<CryptoKey> {
   return masterKey;
 }
 
-export async function saveEncrypted(storeName: 'identity' | 'sessions' | 'prekeys', item: any, idKey: string | number) {
+export async function saveEncrypted(storeName: 'identity' | 'sessions' | 'prekeys' | 'knownKeys', item: any, idKey: string | number) {
   if (!dbPromise) initDB();
   const key = await getMasterKey();
   const iv = window.crypto.getRandomValues(new Uint8Array(12));
@@ -75,7 +88,7 @@ export async function saveEncrypted(storeName: 'identity' | 'sessions' | 'prekey
   } as any);
 }
 
-export async function loadEncrypted(storeName: 'identity' | 'sessions' | 'prekeys', idKey: string | number): Promise<any | null> {
+export async function loadEncrypted(storeName: 'identity' | 'sessions' | 'prekeys' | 'knownKeys', idKey: string | number): Promise<any | null> {
   if (!dbPromise) initDB();
   const db = await dbPromise;
   const record = await db.get(storeName, idKey as any);

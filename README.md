@@ -4,7 +4,7 @@
 
 ## Features
 - **End-to-End Encryption:** Double Ratchet ECIES with AES-GCM and ephemeral ECDH (X25519).
-- **Zero-Knowledge Identity:** Sender authentication via independently verified ECDSA P-256 signatures. The server cannot forge messages.
+- **Zero-Knowledge Identity:** Sender authentication via independently verified ECDSA P-256 signatures. Provides a mechanism to detect server-side impersonation, when used.
 - **Robust Replay Protection:** Per-message UUID nonce deduplication with a strict 7-day TTL window (synchronized securely across browser tabs via Web Locks API).
 - **Encrypted Media:** Client-side convergent encryption (ChaCha20-Poly1305) for attachments, chunked securely to a self-hosted S3-compatible backend (MinIO).
 - **Ephemeral Rate Limiting:** IP-based and handle-based limiters to prevent global and targeted enumeration attacks.
@@ -16,6 +16,9 @@
   - **PostgreSQL:** For persisting public keys and routing identities.
   - **Redis:** For the offline message queue (7-day TTL).
   - **MinIO:** For encrypted media attachment blobs.
+
+### Deployment & Scaling Constraints
+**Note:** The current backend architecture utilizes in-memory `HashMap` structures for WebSocket connection mapping and rate-limiting. This design explicitly constrains deployment to a **single backend instance**. Running multiple load-balanced instances of the backend will result in fragmented connection states (users routed to different instances will be unable to communicate) and bypassed rate limits. To scale horizontally beyond a single process, the connection map and rate limiters must first be migrated to Redis.
 
 ## Prerequisites
 - Docker & Docker Compose

@@ -1,10 +1,9 @@
 use sqlx::postgres::PgPoolOptions;
-use tokio;
 
 #[tokio::main]
 async fn main() {
     let db_conn_string = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://shhhchat:password@localhost:5432/shhh".to_string());
+        .unwrap_or_else(|_| "postgres://securechat:CHANGEME@localhost:5432/securechat".to_string());
     
     let pool = PgPoolOptions::new()
         .max_connections(5)

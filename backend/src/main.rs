@@ -18,6 +18,10 @@ use chrono::Utc;
 use axum::extract::ConnectInfo;
 use std::net::SocketAddr;
 
+// Type aliases for complex rate-limiter map types
+type HandleRateLimiter = Arc<Mutex<HashMap<String, (u32, chrono::DateTime<Utc>)>>>;
+type IpRateLimiter = Arc<Mutex<HashMap<std::net::IpAddr, (u32, chrono::DateTime<Utc>)>>>;
+
 // --- DTOs ---
 #[derive(Deserialize, Serialize, Clone)]
 struct RegisterRequest {
@@ -58,8 +62,8 @@ struct AppState {
     redis_client: redis::Client,
     s3_client: s3::Client,
     active_connections: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
-    handle_rate_limiter: Arc<Mutex<HashMap<String, (u32, chrono::DateTime<Utc>)>>>,
-    ip_rate_limiter: Arc<Mutex<HashMap<std::net::IpAddr, (u32, chrono::DateTime<Utc>)>>>,
+    handle_rate_limiter: HandleRateLimiter,
+    ip_rate_limiter: IpRateLimiter,
 }
 
 #[derive(Deserialize)]
@@ -304,11 +308,20 @@ async fn message_handler(
     let msg_id = uuid::Uuid::new_v4().to_string();
     let queue_key = format!("queue:{}", envelope.to_routing_token);
     
-    if let Ok(mut conn) = state.redis_client.get_multiplexed_async_connection().await {
-        let _: () = redis::pipe()
-            .hset(&queue_key, &msg_id, &envelope.encrypted_payload)
-            .expire(&queue_key, 604800)
-            .query_async(&mut conn).await.unwrap_or(());
+    match state.redis_client.get_multiplexed_async_connection().await {
+        Ok(mut conn) => {
+            let res: Result<(), _> = redis::pipe()
+                .hset(&queue_key, &msg_id, &envelope.encrypted_payload)
+                .expire(&queue_key, 604800)
+                .ignore()
+                .query_async(&mut conn).await;
+            if let Err(e) = res {
+                error!("Redis pipe error in /api/message: {:?}", e);
+            }
+        }
+        Err(e) => {
+            error!("Redis connection error in /api/message: {:?}", e);
+        }
     }
     
     let conns = state.active_connections.lock().await;
@@ -398,6 +411,7 @@ async fn handle_socket(mut socket: WebSocket, token: String, state: Arc<AppState
                             let _: () = redis::pipe()
                                 .hset(&queue_key, &msg_id, &envelope.encrypted_payload)
                                 .expire(&queue_key, 604800)
+                                .ignore()
                                 .query_async(&mut conn).await.unwrap_or(());
                         }
 

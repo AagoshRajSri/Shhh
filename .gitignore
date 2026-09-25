@@ -1,6 +1,39 @@
-node_modules
-target
-target-cli
-dist
+# Dependencies and build outputs
+node_modules/
+target/
+target-cli/
+dist/
+dist-ssr/
+
+# Environment files and secrets
 .env
+.env.*
+*.env
+!.env.example
+
+# Binaries, archives, and tools
+*.exe
+*.zip
+*.tar.gz
+*.dll
+*.so
+*.dylib
+gitleaks*
+rustup-init*
+
+# Logs
+*.log
+logs/
+
+# OS and Editor
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+
+# Temporary and local artifacts
+.tempmediaStorage/
+scratch/
