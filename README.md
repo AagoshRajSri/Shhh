@@ -61,3 +61,11 @@ Open your browser to `http://localhost:5173`.
 Shhh is built on the principle of **Trust-On-First-Use (TOFU)** augmented with out-of-band verification. 
 
 Inside an active chat, click on the remote user's handle to reveal the **Safety Number**. Compare this 60-digit fingerprint with your contact over a secure, out-of-band channel (e.g., in person or a trusted video call). If the numbers match, you are guaranteed that no Man-In-The-Middle (MITM) attack or server-side key impersonation has occurred.
+
+## Legal & Transparency
+Shhh is designed around the principles of privacy and minimal data collection. Because the application utilizes true End-to-End Encryption (E2EE) and sealed sender routing, the server does not possess the cryptographic keys required to decrypt message contents or media. 
+* We do not collect traditional Personally Identifiable Information (PII) such as names, emails, or phone numbers. 
+* This project is open-source to allow for public audit and reproducible builds, ensuring transparency in how data is (and isn't) handled.
+
+## License
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
