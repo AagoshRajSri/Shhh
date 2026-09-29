@@ -460,7 +460,7 @@ export default function App() {
         <div className="flex h-screen w-full">
             <div className="w-full hidden md:inline-block relative">
                 <div className={`absolute inset-0 ${lightMode ? 'bg-black/5' : 'bg-black/60'} pointer-events-none z-10`} />
-                <img className="h-full w-full object-cover" src="/login-banner.png" alt="leftSideImage" />
+                <img className="h-full w-full object-cover" src="/secure_banner.jpg" alt="leftSideImage" />
             </div>
         
             <div className={`w-full flex flex-col items-center justify-center ${lightMode ? 'bg-white' : 'bg-black'}`}>
