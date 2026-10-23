@@ -1,8 +1,12 @@
+# Configuration for cargo-audit
 [advisories]
 ignore = [
-    "RUSTSEC-2026-0258", # h2 unbounded empty DATA frames (Isolated to aws-sdk-s3 outbound)
-    "RUSTSEC-2023-0071", # rsa Marvin Attack (Isolated to aws-sdk-s3 outbound)
-    "RUSTSEC-2026-0098", # rustls-webpki Name constraints (Isolated to aws-sdk-s3 outbound)
-    "RUSTSEC-2026-0099", # rustls-webpki Name constraints wildcard (Isolated to aws-sdk-s3 outbound)
-    "RUSTSEC-2026-0104", # rustls-webpki Reachable panic (Isolated to aws-sdk-s3 outbound)
+    "RUSTSEC-2026-0346", # upstream in aws-smithy-http-client (rustls 0.21.12)
+    "RUSTSEC-2026-0349", # upstream in aws-smithy-http-client (rustls 0.21.12)
+    "RUSTSEC-2026-0382", # upstream in aws-smithy-http-client (rustls-webpki 0.101.7)
+    "RUSTSEC-2026-0098", # upstream in aws-smithy-http-client (rustls-webpki 0.101.7)
+    "RUSTSEC-2026-0099", # upstream in aws-smithy-http-client (rustls-webpki 0.101.7)
+    "RUSTSEC-2026-0104", # upstream in aws-smithy-http-client (rustls-webpki 0.101.7)
+    "RUSTSEC-2026-0258", # upstream in hyper 0.14 (h2 0.3.27)
+    "RUSTSEC-2023-0071", # upstream in rsa crate (timing sidechannel)
 ]

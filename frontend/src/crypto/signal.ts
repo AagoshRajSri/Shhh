@@ -1,5 +1,16 @@
 import { saveEncrypted, loadEncrypted } from './db';
 
+export function getApiUrl(): string {
+  if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL;
+  if (typeof window !== 'undefined' && window.location) {
+    if (window.location.port === '5173' || window.location.port === '5174') {
+      return `${window.location.protocol}//${window.location.hostname}:3000`;
+    }
+    return window.location.origin;
+  }
+  return 'http://localhost:3000';
+}
+
 // Double Ratchet ECIES Phase 1: Real AES-GCM Encryption with Ephemeral ECDH
 function arrayBufferToBase64(buffer: ArrayBuffer) {
   let binary = '';
@@ -325,15 +336,33 @@ export class SignalService {
         throw new Error(`CRITICAL: Identity mismatch! Message signed by ${claimedSender} but routed from ${expectedSender}`);
       }
 
-      // Fetch the claimed sender's public keys from the relay
-      // Note: In a real app this would use a pinned key or TOFU, but this proves the concept
-      const res = await fetch(`http://localhost:3000/api/lookup/${encodeURIComponent(claimedSender)}`);
-      const data = await res.json();
-      if (data.status !== 'success' || !data.identity_pubkey) {
-        throw new Error(`Failed to lookup claimed sender ${claimedSender}`);
+      // Check client-side cached contact keys first (in knownKeys store)
+      let identityPubkey: string | null = null;
+      const cached = await loadEncrypted('knownKeys', claimedSender);
+      if (cached && cached.keyB64) {
+        identityPubkey = cached.keyB64;
+      } else {
+        // Fetch from relay passing authenticated routing token if available
+        const tokenRec = await loadEncrypted('identity', 'routing_token');
+        const headers: Record<string, string> = {};
+        if (tokenRec?.routingToken) {
+          headers['X-Routing-Token'] = tokenRec.routingToken;
+        }
+        const apiUrl = getApiUrl();
+        const res = await fetch(`${apiUrl}/api/lookup/${encodeURIComponent(claimedSender)}`, { headers });
+        const data = await res.json();
+        if (data.status !== 'success' || !data.identity_pubkey) {
+          throw new Error(`Failed to lookup claimed sender ${claimedSender}`);
+        }
+        identityPubkey = data.identity_pubkey;
+        await saveEncrypted('knownKeys', { handle: claimedSender, address: claimedSender, keyB64: identityPubkey }, claimedSender);
       }
       
-      const remote_keys = JSON.parse(atob(data.identity_pubkey));
+      if (!identityPubkey) {
+        throw new Error(`Failed to resolve identity public key for ${claimedSender}`);
+      }
+
+      const remote_keys = JSON.parse(atob(identityPubkey));
       const sigJWK = remote_keys.sigJWK;
       if (!sigJWK) {
         throw new Error("Sender does not have an ECDSA signing key registered.");

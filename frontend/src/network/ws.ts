@@ -1,5 +1,17 @@
 type MessageHandler = (message: any) => void;
 
+export function getWsUrl(): string {
+  if (import.meta.env.VITE_WS_URL) return import.meta.env.VITE_WS_URL;
+  if (typeof window !== 'undefined' && window.location) {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    if (window.location.port === '5173' || window.location.port === '5174') {
+      return `${proto}//${window.location.hostname}:3000/ws`;
+    }
+    return `${proto}//${window.location.host}/ws`;
+  }
+  return 'ws://localhost:3000/ws';
+}
+
 export class WSService {
   private ws: WebSocket | null = null;
   private messageHandlers: Set<MessageHandler> = new Set();
@@ -10,8 +22,8 @@ export class WSService {
     if (this.ws?.readyState === WebSocket.OPEN || this.isConnecting) return;
     this.isConnecting = true;
 
-    // Use dynamic WS URL from environment or fallback to localhost
-    const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3000/ws';
+    // Use dynamic WS URL from environment or current origin
+    const WS_URL = getWsUrl();
     console.log(`Connecting to Relay via WebSocket: ${WS_URL}`);
     
     // Pass routing token as a subprotocol to avoid leaking it in URLs

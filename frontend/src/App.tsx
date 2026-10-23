@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect } from 'react';
-import { Send, Sun, Moon, ShieldAlert, FileText, Check, X, AlertTriangle, Plus, Image as ImageIcon, Video } from 'lucide-react';
-import { initDB, saveEncrypted } from './crypto/db';
-import { signalService } from './crypto/signal';
+import { Send, Sun, Moon, ShieldAlert, FileText, Check, X, AlertTriangle, Plus, Image as ImageIcon, Video, Download } from 'lucide-react';
+import { initDB, saveEncrypted, loadEncrypted, exportIdentity, importIdentity } from './crypto/db';
+import { signalService, getApiUrl } from './crypto/signal';
+import { solvePoW } from './crypto/pow';
 import { wsService } from './network/ws';
 import { encryptMediaChunked, decryptMediaChunked } from './crypto/media';
 type Message = {
@@ -21,7 +22,7 @@ type Message = {
   };
 };
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+const API_URL = getApiUrl();
 
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -38,9 +39,12 @@ export default function App() {
   const [showAttachmentMenu, setShowAttachmentMenu] = useState(false);
   const attachmentMenuRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const importFileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [safetyNumber, setSafetyNumber] = useState<string | null>(null);
   const [keyChangeWarning, setKeyChangeWarning] = useState<{message: string, handle: string, pubkey: string} | null>(null);
+  const [myRoutingToken, setMyRoutingToken] = useState<string | null>(null);
+  const [powStatus, setPowStatus] = useState<string>('');
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -59,6 +63,85 @@ export default function App() {
   }, []);
 
   const [isInitializing, setIsInitializing] = useState(false);
+
+  const lookupContact = async (targetHandle: string): Promise<{ routing_token: string; identity_pubkey: string } | null> => {
+    try {
+      const cached = await loadEncrypted('knownKeys', targetHandle);
+      if (cached && cached.routing_token && cached.identity_pubkey) {
+        return { routing_token: cached.routing_token, identity_pubkey: cached.identity_pubkey };
+      }
+
+      const headers: Record<string, string> = {};
+      const tokenRec = await loadEncrypted('identity', 'routing_token');
+      const curToken = myRoutingToken || tokenRec?.routingToken;
+      if (curToken) {
+        headers['X-Routing-Token'] = curToken;
+      }
+
+      const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(targetHandle)}`, { headers });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data.status === 'success' && data.routing_token) {
+        await saveEncrypted('knownKeys', {
+          address: targetHandle,
+          handle: targetHandle,
+          routing_token: data.routing_token,
+          identity_pubkey: data.identity_pubkey,
+          keyB64: data.identity_pubkey,
+        }, targetHandle);
+        return data;
+      }
+      return null;
+    } catch (e) {
+      console.error('Lookup failed for ' + targetHandle, e);
+      return null;
+    }
+  };
+
+  const handleExportBackup = async () => {
+    const pw = prompt("Enter a passphrase to encrypt your identity backup (minimum 8 characters):");
+    if (!pw || pw.length < 8) {
+      if (pw !== null) alert("Passphrase must be at least 8 characters.");
+      return;
+    }
+    try {
+      const tokenRec = await loadEncrypted('identity', 'routing_token');
+      const token = myRoutingToken || tokenRec?.routingToken || '';
+      const backupJson = await exportIdentity(handle, token, pw);
+      const blob = new Blob([backupJson], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `shhh_identity_${handle.replace('#', '')}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      alert("Identity backup downloaded! Keep this file and your passphrase safe to restore on Tor Browser or other devices.");
+    } catch (e: any) {
+      alert("Export failed: " + e.message);
+    }
+  };
+
+  const handleImportBackup = async (file: File) => {
+    const pw = prompt("Enter the passphrase used to encrypt this backup:");
+    if (!pw) return;
+    try {
+      setIsInitializing(true);
+      setPowStatus("Decrypting and restoring identity vault...");
+      const text = await file.text();
+      const restored = await importIdentity(text, pw);
+      setHandle(restored.handle);
+      setMyRoutingToken(restored.routing_token);
+      await saveEncrypted('identity', { routingToken: restored.routing_token, handle: restored.handle }, 'routing_token');
+      wsService.connect(restored.routing_token);
+      setIsLoggedIn(true);
+      alert(`Identity ${restored.handle} successfully restored!`);
+    } catch (e: any) {
+      alert("Import failed: " + e.message);
+    } finally {
+      setIsInitializing(false);
+      setPowStatus("");
+    }
+  };
 
   const handleLogin = async () => {
     let cleanHandle = handle.trim();
@@ -80,14 +163,20 @@ export default function App() {
       await signalService.generateIdentity();
       identityBundle = await signalService.generatePreKeyBundle();
     } else {
-      identityBundle = await signalService.generatePreKeyBundle(); // Re-generate bundle for registration
+      identityBundle = await signalService.generatePreKeyBundle();
     }
     
-    let routingToken = null;
+    let routingToken: string | null = null;
 
     try {
       if (!hasIdentity) {
-        const response = await fetch('${API_URL}/api/register', {
+        setPowStatus('Computing cryptographic proof-of-work (difficulty 20)...');
+        const pow_nonce = await solvePoW(cleanHandle, 20, (attempts) => {
+          setPowStatus(`Mining PoW (${attempts.toLocaleString()} hashes)...`);
+        });
+
+        setPowStatus('Registering identity with relay...');
+        const response = await fetch(`${API_URL}/api/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -95,13 +184,10 @@ export default function App() {
             identity_public_key: identityBundle.identityKey,
             signed_prekey: identityBundle.signedPreKey.publicKey,
             one_time_prekeys: identityBundle.preKeys.map((pk: any) => pk.publicKey),
-            kyber_public_key: identityBundle.kyberPreKey
+            kyber_public_key: identityBundle.kyberPreKey,
+            pow_nonce
           })
         });
-        
-        if (response.status === 409) {
-          throw new Error("Username already taken. Please choose a different username.");
-        }
 
         if (!response.ok) {
           throw new Error(`Registration failed: ${response.status}`);
@@ -109,30 +195,54 @@ export default function App() {
 
         const data = await response.json();
         routingToken = data.routing_token;
+        const assigned = data.assigned_handle || cleanHandle;
+        if (assigned !== cleanHandle) {
+          alert(`Notice: Handle was already in use. You have been assigned: ${assigned}`);
+          cleanHandle = assigned;
+          setHandle(assigned);
+        }
+
+        await saveEncrypted('identity', { routingToken, handle: cleanHandle }, 'routing_token');
+        setMyRoutingToken(routingToken);
       } else {
-        // User already has a local identity. Lookup their own routing token.
-        const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(cleanHandle)}`);
-        if (res.status === 429) {
-          throw new Error("Too many requests. Please wait a moment.");
+        // User already has a local identity. Check if routing token is stored locally.
+        const tokenRec = await loadEncrypted('identity', 'routing_token');
+        if (tokenRec && tokenRec.routingToken) {
+          routingToken = tokenRec.routingToken;
+          setMyRoutingToken(routingToken);
+          if (tokenRec.handle) {
+            cleanHandle = tokenRec.handle;
+            setHandle(tokenRec.handle);
+          }
+        } else {
+          // Fallback: Lookup routing token from server
+          const headers: Record<string, string> = {};
+          if (myRoutingToken) headers['X-Routing-Token'] = myRoutingToken;
+          const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(cleanHandle)}`, { headers });
+          if (res.status === 429) {
+            throw new Error("Too many requests. Please wait a moment.");
+          }
+          if (!res.ok) {
+            throw new Error(`Failed to lookup existing user: ${res.status}`);
+          }
+          const data = await res.json();
+          routingToken = data.routing_token;
+          await saveEncrypted('identity', { routingToken, handle: cleanHandle }, 'routing_token');
+          setMyRoutingToken(routingToken);
         }
-        if (!res.ok) {
-          throw new Error(`Failed to lookup existing user: ${res.status}`);
-        }
-        const data = await res.json();
-        routingToken = data.routing_token;
       }
 
       if (routingToken) {
         wsService.connect(routingToken);
+        setIsLoggedIn(true);
       }
     } catch (err: any) {
       console.warn("Backend error, falling back to mock routing token for dev", err);
-      if (err.message && err.message.includes("already taken")) {
-        alert(err.message + "\n\n(If this was your account but you cleared your browser data, your keys are lost and you must choose a new username).");
-        setIsInitializing(false);
-        return;
-      }
       wsService.connect('my-mock-routing-token');
+      setIsLoggedIn(true);
+    } finally {
+      setIsInitializing(false);
+      setPowStatus('');
     }
     
     // Subscribe to incoming messages
@@ -202,13 +312,12 @@ export default function App() {
       return;
     }
 
-    // 3. Exists in Database & Get Routing Token
+    // 3. Exists in Database & Get Routing Token (checks local knownKeys cache first)
     try {
-      const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(targetHandle)}`);
-      const data = await res.json();
+      const data = await lookupContact(targetHandle);
       
-      if (data.status !== 'success' || !data.routing_token) {
-        setErrorMsg(`User ${targetHandle} does not exist in the database.`);
+      if (!data || !data.routing_token) {
+        setErrorMsg(`User ${targetHandle} could not be resolved or does not exist.`);
         return;
       }
       
@@ -286,8 +395,8 @@ export default function App() {
       const { chunks, key, contentHash } = await encryptMediaChunked(file);
       const keyHex = Array.from(key).map(b => b.toString(16).padStart(2, '0')).join('');
       
-      // 2. Initialize S3 Multipart Upload
-      const initRes = await fetch('${API_URL}/api/upload/init', {
+      // 2. Initialize S3 Multipart Upload via relay proxy
+      const initRes = await fetch(`${API_URL}/api/upload/init`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ hash: contentHash, parts: chunks.length })
@@ -295,10 +404,11 @@ export default function App() {
       const initData = await initRes.json();
       
       if (initData.status === 'uploading' && initData.urls) {
-        // Upload each chunk to its presigned URL
+        // Upload each chunk to its proxied URL
         const etags = [];
         for (let i = 0; i < chunks.length; i++) {
-          const uploadRes = await fetch(initData.urls[i], {
+          const uploadUrl = initData.urls[i].startsWith('http') ? initData.urls[i] : `${API_URL}${initData.urls[i]}`;
+          const uploadRes = await fetch(uploadUrl, {
             method: 'PUT',
             body: chunks[i]
           });
@@ -307,7 +417,7 @@ export default function App() {
         }
         
         // Complete the multipart upload
-        await fetch('${API_URL}/api/upload/complete', {
+        await fetch(`${API_URL}/api/upload/complete`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ hash: contentHash, upload_id: initData.upload_id, etags })
@@ -329,9 +439,8 @@ export default function App() {
         attachment
       };
       
-      const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(activeChat)}`);
-      const data = await res.json();
-      if (data.status === 'success' && data.routing_token) {
+      const data = await lookupContact(activeChat);
+      if (data && data.routing_token) {
         if (await signalService.checkKeyChange(activeChat, data.identity_pubkey)) {
           alert(`WARNING: The security keys for ${activeChat} have changed! This could mean they re-registered, or it could be a man-in-the-middle attack. Verify safety numbers!`);
         }
@@ -369,9 +478,8 @@ export default function App() {
 
     // Notify sender that their request was accepted
     try {
-      const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(from)}`);
-      const data = await res.json();
-      if (data.status === 'success' && data.routing_token) {
+      const data = await lookupContact(from);
+      if (data && data.routing_token) {
         const payload = {
           from: handle,
           type: 'message',
@@ -412,7 +520,8 @@ export default function App() {
       const data = await res.json();
       if (!data.url) throw new Error("No download URL returned");
       
-      const blobRes = await fetch(data.url);
+      const downloadUrl = data.url.startsWith('http') ? data.url : `${API_URL}${data.url}`;
+      const blobRes = await fetch(downloadUrl);
       const encryptedBlob = await blobRes.blob();
       
       const keyBytes = new Uint8Array(msg.attachment.keyHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
@@ -433,9 +542,8 @@ export default function App() {
   const verifySafetyNumber = async () => {
     if (!activeChat) return;
     try {
-      const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(activeChat)}`);
-      const data = await res.json();
-      if (data.status === 'success' && data.identity_pubkey) {
+      const data = await lookupContact(activeChat);
+      if (data && data.identity_pubkey) {
         const sn = await signalService.computeSafetyNumber(data.identity_pubkey);
         setSafetyNumber(sn);
       } else {
@@ -518,10 +626,31 @@ export default function App() {
                           : 'bg-white text-black hover:bg-zinc-200'
                       } ${isInitializing ? 'opacity-50 cursor-wait' : ''}`}
                     >
-                        {isInitializing ? 'Generating Secure Identity...' : 'Generate & Login'}
+                        {isInitializing ? (powStatus || 'Generating Secure Identity...') : 'Generate & Login'}
                     </button>
+
+                    <div className="mt-4 flex flex-col items-center gap-2">
+                        <input
+                          type="file"
+                          ref={importFileInputRef}
+                          className="hidden"
+                          accept=".json"
+                          onChange={(e) => {
+                            if (e.target.files && e.target.files[0]) {
+                              handleImportBackup(e.target.files[0]);
+                            }
+                          }}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => importFileInputRef.current?.click()}
+                          className="text-xs text-zinc-400 hover:text-white transition-colors underline cursor-pointer"
+                        >
+                          Tor Browser session? Import Identity Backup (.json)
+                        </button>
+                    </div>
                     
-                    <p className={`text-sm mt-6 ${lightMode ? 'text-gray-500' : 'text-zinc-500'}`}>
+                    <p className={`text-sm mt-4 ${lightMode ? 'text-gray-500' : 'text-zinc-500'}`}>
                         Keys never leave your device.
                     </p>
                 </form>
@@ -585,12 +714,26 @@ export default function App() {
         </div>
       )}
 
-      <button 
-        onClick={() => setLightMode(!lightMode)} 
-        className="absolute top-4 right-4 p-2 opacity-30 hover:opacity-100 transition-opacity z-10"
-      >
-        {lightMode ? <Moon size={20} /> : <Sun size={20} />}
-      </button>
+      <div className="absolute top-4 right-4 flex items-center gap-2 z-10">
+        <button
+          onClick={handleExportBackup}
+          title="Export Identity Backup (Argon2id encrypted)"
+          className={`px-3 py-1.5 rounded-full text-xs font-mono flex items-center gap-1.5 border transition-all ${
+            lightMode
+              ? 'border-zinc-300 text-zinc-700 hover:bg-zinc-100'
+              : 'border-zinc-800 text-zinc-300 hover:bg-zinc-900 hover:border-zinc-700'
+          }`}
+        >
+          <Download size={14} />
+          <span>Backup Identity</span>
+        </button>
+        <button 
+          onClick={() => setLightMode(!lightMode)} 
+          className="p-2 opacity-40 hover:opacity-100 transition-opacity"
+        >
+          {lightMode ? <Moon size={20} /> : <Sun size={20} />}
+        </button>
+      </div>
 
       {safetyNumber && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
