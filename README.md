@@ -3,7 +3,7 @@
 **Shhh** is a zero-knowledge, end-to-end encrypted messaging application. It ensures that only you and your intended recipient can read your messages. The server acts purely as a blind relay and holds no cryptographic capability to impersonate users or decrypt traffic.
 
 ## Features
-- **End-to-End Encryption:** Double Ratchet ECIES with AES-GCM and ephemeral ECDH (X25519).
+- **End-to-End Encryption:** ECIES with AES-GCM and ephemeral ECDH (X25519).
 - **Zero-Knowledge Identity:** Sender authentication via independently verified ECDSA P-256 signatures. Provides a mechanism to detect server-side impersonation, when used.
 - **Robust Replay Protection:** Per-message UUID nonce deduplication with a strict 7-day TTL window (synchronized securely across browser tabs via Web Locks API).
 - **Encrypted Media:** Client-side convergent encryption (ChaCha20-Poly1305) for attachments, chunked securely to a self-hosted S3-compatible backend (MinIO).
