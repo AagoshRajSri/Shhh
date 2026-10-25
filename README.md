@@ -6,6 +6,8 @@
 - **End-to-End Encryption:** ECIES with AES-GCM and ephemeral ECDH (X25519).
 - **Zero-Knowledge Identity:** Sender authentication via independently verified ECDSA P-256 signatures. Provides a mechanism to detect server-side impersonation, when used.
 - **Robust Replay Protection:** Per-message UUID nonce deduplication with a strict 7-day TTL window (synchronized securely across browser tabs via Web Locks API).
+- **Proof-of-Work Registration:** Client-side PoW difficulty challenge to mitigate automated handle registration and Sybil attacks.
+- **Identity Vault:** Password-protected identity key backup and export using Argon2id key derivation.
 - **Encrypted Media:** Client-side convergent encryption (ChaCha20-Poly1305) for attachments, chunked securely to a self-hosted S3-compatible backend (MinIO).
 - **Ephemeral Rate Limiting:** IP-based and handle-based limiters to prevent global and targeted enumeration attacks.
 
@@ -56,6 +58,15 @@ npm install
 npm run dev
 ```
 Open your browser to `http://localhost:5173`.
+
+### 5. Running Tests
+```bash
+# Backend unit & integration tests
+cargo test --manifest-path backend/Cargo.toml
+
+# Frontend build & type check
+npm --prefix frontend run build
+```
 
 ## Security Model
 Shhh is built on the principle of **Trust-On-First-Use (TOFU)** augmented with out-of-band verification. 
