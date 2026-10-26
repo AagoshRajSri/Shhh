@@ -3,6 +3,8 @@ name = "securechat-backend"
 version = "0.1.0"
 edition = "2021"
 default-run = "securechat-backend"
+license = "MIT"
+description = "Zero-knowledge end-to-end encrypted messaging relay"
 
 [dependencies]
 axum = { version = "0.7.4", features = ["ws"] }
