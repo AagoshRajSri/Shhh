@@ -11,7 +11,7 @@ export function getApiUrl(): string {
   return 'http://localhost:3000';
 }
 
-// Double Ratchet ECIES Phase 1: Real AES-GCM Encryption with Ephemeral ECDH
+// ECIES: Real AES-GCM Encryption with Ephemeral ECDH
 function arrayBufferToBase64(buffer: ArrayBuffer) {
   let binary = '';
   const bytes = new Uint8Array(buffer);
@@ -167,7 +167,7 @@ export class SignalService {
   }
 
   async encryptMessage(remoteHandle: string, remoteIdentityKeyB64: string, payload: any): Promise<string> {
-    console.log(`Encrypting Double Ratchet message for ${remoteHandle}`);
+    console.log(`Encrypting ECIES message for ${remoteHandle}`);
     
     if (remoteIdentityKeyB64 === 'fake_pubkey') {
       return `ciphertext(ratchet_adv):${btoa(JSON.stringify(payload))}`;
