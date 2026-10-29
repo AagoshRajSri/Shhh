@@ -44,6 +44,7 @@ export default function App() {
   const [safetyNumber, setSafetyNumber] = useState<string | null>(null);
   const [keyChangeWarning, setKeyChangeWarning] = useState<{message: string, handle: string, pubkey: string} | null>(null);
   const [myRoutingToken, setMyRoutingToken] = useState<string | null>(null);
+  const [myReceiveSecret, setMyReceiveSecret] = useState<string | null>(null);
   const [powStatus, setPowStatus] = useState<string>('');
 
   useEffect(() => {
@@ -63,6 +64,37 @@ export default function App() {
   }, []);
 
   const [isInitializing, setIsInitializing] = useState(false);
+  // null = not yet checked, true = all required APIs present, string = missing API name
+  const [cryptoSupported, setCryptoSupported] = useState<null | true | string>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        if (!window.crypto?.subtle) {
+          setCryptoSupported('crypto.subtle is unavailable. Ensure you are on a secure origin (HTTPS or .onion).');
+          return;
+        }
+        // Probe X25519 (ECDH key exchange)
+        await window.crypto.subtle.generateKey(
+          { name: 'X25519' },
+          false,
+          ['deriveKey', 'deriveBits']
+        );
+        // Probe ECDSA P-256 (signing)
+        await window.crypto.subtle.generateKey(
+          { name: 'ECDSA', namedCurve: 'P-256' },
+          false,
+          ['sign', 'verify']
+        );
+        setCryptoSupported(true);
+      } catch (e: any) {
+        setCryptoSupported(
+          `Required cryptographic algorithm not supported: ${e?.message ?? e}. ` +
+          'Please use Tor Browser 13.5 or later (Firefox ESR 115+).'
+        );
+      }
+    })();
+  }, []);
 
   const lookupContact = async (targetHandle: string): Promise<{ routing_token: string; identity_pubkey: string } | null> => {
     try {
@@ -72,10 +104,10 @@ export default function App() {
       }
 
       const headers: Record<string, string> = {};
-      const tokenRec = await loadEncrypted('identity', 'routing_token');
-      const curToken = myRoutingToken || tokenRec?.routingToken;
-      if (curToken) {
-        headers['X-Routing-Token'] = curToken;
+      const secRec = await loadEncrypted('identity', 'receive_secret');
+      const curSecret = myReceiveSecret || secRec?.receiveSecret;
+      if (curSecret) {
+        headers['X-Receive-Secret'] = curSecret;
       }
 
       const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(targetHandle)}`, { headers });
@@ -106,8 +138,10 @@ export default function App() {
     }
     try {
       const tokenRec = await loadEncrypted('identity', 'routing_token');
-      const token = myRoutingToken || tokenRec?.routingToken || '';
-      const backupJson = await exportIdentity(handle, token, pw);
+      const secRec = await loadEncrypted('identity', 'receive_secret');
+      const token = myRoutingToken || tokenRec?.inboxId || tokenRec?.routingToken || '';
+      const secret = myReceiveSecret || secRec?.receiveSecret || '';
+      const backupJson = await exportIdentity(handle, token, pw, secret);
       const blob = new Blob([backupJson], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -130,9 +164,12 @@ export default function App() {
       const text = await file.text();
       const restored = await importIdentity(text, pw);
       setHandle(restored.handle);
-      setMyRoutingToken(restored.routing_token);
-      await saveEncrypted('identity', { routingToken: restored.routing_token, handle: restored.handle }, 'routing_token');
-      wsService.connect(restored.routing_token);
+      const inboxId = restored.inbox_id || restored.routing_token;
+      setMyRoutingToken(inboxId);
+      if (restored.receive_secret) {
+        setMyReceiveSecret(restored.receive_secret);
+        wsService.connect(restored.receive_secret);
+      }
       setIsLoggedIn(true);
       alert(`Identity ${restored.handle} successfully restored!`);
     } catch (e: any) {
@@ -175,6 +212,11 @@ export default function App() {
           setPowStatus(`Mining PoW (${attempts.toLocaleString()} hashes)...`);
         });
 
+        // 256 random bits client-side secret
+        const secretBytes = new Uint8Array(32);
+        window.crypto.getRandomValues(secretBytes);
+        const receive_secret = Array.from(secretBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+
         setPowStatus('Registering identity with relay...');
         const response = await fetch(`${API_URL}/api/register`, {
           method: 'POST',
@@ -185,7 +227,8 @@ export default function App() {
             signed_prekey: identityBundle.signedPreKey.publicKey,
             one_time_prekeys: identityBundle.preKeys.map((pk: any) => pk.publicKey),
             kyber_public_key: identityBundle.kyberPreKey,
-            pow_nonce
+            pow_nonce,
+            receive_secret,
           })
         });
 
@@ -194,7 +237,8 @@ export default function App() {
         }
 
         const data = await response.json();
-        routingToken = data.routing_token;
+        const inboxId = data.inbox_id || data.routing_token;
+        routingToken = inboxId;
         const assigned = data.assigned_handle || cleanHandle;
         if (assigned !== cleanHandle) {
           alert(`Notice: Handle was already in use. You have been assigned: ${assigned}`);
@@ -202,33 +246,30 @@ export default function App() {
           setHandle(assigned);
         }
 
-        await saveEncrypted('identity', { routingToken, handle: cleanHandle }, 'routing_token');
-        setMyRoutingToken(routingToken);
+        await saveEncrypted('identity', { routingToken: inboxId, inboxId, handle: cleanHandle }, 'routing_token');
+        await saveEncrypted('identity', { receiveSecret: receive_secret }, 'receive_secret');
+        setMyRoutingToken(inboxId);
+        setMyReceiveSecret(receive_secret);
+        wsService.connect(receive_secret);
+        setIsLoggedIn(true);
       } else {
-        // User already has a local identity. Check if routing token is stored locally.
+        const secRec = await loadEncrypted('identity', 'receive_secret');
         const tokenRec = await loadEncrypted('identity', 'routing_token');
-        if (tokenRec && tokenRec.routingToken) {
-          routingToken = tokenRec.routingToken;
-          setMyRoutingToken(routingToken);
+        const curSecret = secRec?.receiveSecret;
+        const inboxId = tokenRec?.inboxId || tokenRec?.routingToken;
+
+        if (tokenRec && inboxId) {
+          routingToken = inboxId;
+          setMyRoutingToken(inboxId);
           if (tokenRec.handle) {
             cleanHandle = tokenRec.handle;
             setHandle(tokenRec.handle);
           }
-        } else {
-          // Fallback: Lookup routing token from server
-          const headers: Record<string, string> = {};
-          if (myRoutingToken) headers['X-Routing-Token'] = myRoutingToken;
-          const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(cleanHandle)}`, { headers });
-          if (res.status === 429) {
-            throw new Error("Too many requests. Please wait a moment.");
-          }
-          if (!res.ok) {
-            throw new Error(`Failed to lookup existing user: ${res.status}`);
-          }
-          const data = await res.json();
-          routingToken = data.routing_token;
-          await saveEncrypted('identity', { routingToken, handle: cleanHandle }, 'routing_token');
-          setMyRoutingToken(routingToken);
+        }
+        if (curSecret) {
+          setMyReceiveSecret(curSecret);
+          wsService.connect(curSecret);
+          setIsLoggedIn(true);
         }
       }
 
@@ -554,6 +595,37 @@ export default function App() {
       alert('Failed to compute safety number.');
     }
   };
+
+  // Crypto feature gate — shown before anything else renders
+  if (cryptoSupported === null) {
+    return (
+      <div className="min-h-screen bg-black flex items-center justify-center">
+        <p className="text-zinc-600 text-sm font-mono animate-pulse">Checking cryptographic support…</p>
+      </div>
+    );
+  }
+
+  if (cryptoSupported !== true) {
+    return (
+      <div className="min-h-screen bg-black text-white flex items-center justify-center p-6">
+        <div className="max-w-md w-full border border-red-900/60 rounded-2xl p-8 bg-red-950/20">
+          <div className="flex items-center gap-3 mb-4 text-red-400">
+            <AlertTriangle className="w-8 h-8 shrink-0" />
+            <h1 className="text-xl font-semibold">Browser Not Supported</h1>
+          </div>
+          <p className="text-sm text-red-200/80 leading-relaxed mb-4">
+            {cryptoSupported}
+          </p>
+          <p className="text-xs text-zinc-500 leading-relaxed">
+            Shhh requires <strong className="text-zinc-300">Tor Browser 13.5+</strong> (Firefox ESR 115+) or any
+            modern browser in a secure context (HTTPS / .onion). The X25519 key
+            exchange and ECDSA P-256 signing algorithms must be available in{' '}
+            <code className="text-zinc-400">crypto.subtle</code>.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   if (!isLoggedIn) {
     return (

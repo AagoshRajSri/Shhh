@@ -188,11 +188,13 @@ export async function exportIdentity(
   handle: string,
   routingToken: string,
   passphrase: string,
+  receiveSecret?: string,
 ): Promise<string> {
   if (!dbPromise) initDB();
 
   const identity = await loadEncrypted('identity', 'me');
   const seenNonces = await loadEncrypted('identity', 'seen_nonces') ?? {};
+  const secret = receiveSecret || (await loadEncrypted('identity', 'receive_secret'))?.receiveSecret;
 
   // Walk the knownKeys store (contact trust anchors for key-change detection)
   const db = await dbPromise;
@@ -212,7 +214,15 @@ export async function exportIdentity(
     cursor = await cursor.continue();
   }
 
-  const plaintext = JSON.stringify({ handle, routing_token: routingToken, identity, seenNonces, knownKeys: knownKeysOut });
+  const plaintext = JSON.stringify({
+    handle,
+    inbox_id: routingToken,
+    routing_token: routingToken,
+    receive_secret: secret,
+    identity,
+    seenNonces,
+    knownKeys: knownKeysOut,
+  });
   const saltHex = bytesToHex(window.crypto.getRandomValues(new Uint8Array(16)));
   const ivBytes = window.crypto.getRandomValues(new Uint8Array(12));
   const encKey = await deriveKeyFromPassphrase(passphrase, saltHex);
@@ -223,10 +233,10 @@ export async function exportIdentity(
 
 /**
  * Import an Argon2id-encrypted identity backup.
- * Restores identity keys, nonce set, and knownKeys into IndexedDB.
- * Returns { handle, routing_token } on success.
+ * Restores identity keys, receive_secret, nonce set, and knownKeys into IndexedDB.
+ * Returns { handle, routing_token, inbox_id, receive_secret } on success.
  */
-export async function importIdentity(fileContent: string, passphrase: string): Promise<{ handle: string; routing_token: string }> {
+export async function importIdentity(fileContent: string, passphrase: string): Promise<{ handle: string; routing_token: string; inbox_id: string; receive_secret?: string }> {
   if (!dbPromise) initDB();
 
   const exportObj = JSON.parse(fileContent);
@@ -244,11 +254,17 @@ export async function importIdentity(fileContent: string, passphrase: string): P
     throw new Error('Incorrect passphrase or corrupted backup file.');
   }
 
-  if (!data.identity || !data.handle || !data.routing_token) {
+  const inboxId = data.inbox_id || data.routing_token;
+  if (!data.identity || !data.handle || !inboxId) {
     throw new Error('Backup file is missing required fields.');
   }
 
   await saveEncrypted('identity', data.identity, 'me');
+  if (data.receive_secret) {
+    await saveEncrypted('identity', { receiveSecret: data.receive_secret }, 'receive_secret');
+  }
+  await saveEncrypted('identity', { routingToken: inboxId, inboxId, handle: data.handle }, 'routing_token');
+
   if (data.seenNonces && Object.keys(data.seenNonces).length > 0) {
     await saveEncrypted('identity', data.seenNonces, 'seen_nonces');
   }
@@ -258,6 +274,6 @@ export async function importIdentity(fileContent: string, passphrase: string): P
     }
   }
 
-  return { handle: data.handle, routing_token: data.routing_token };
+  return { handle: data.handle, routing_token: inboxId, inbox_id: inboxId, receive_secret: data.receive_secret };
 }
 

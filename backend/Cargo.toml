@@ -27,6 +27,8 @@ aws-sdk-s3 = "1.149.0"
 dotenvy = "0.15.7"
 thiserror = "2.0.21"
 regex = "1.11"
+subtle = "2.6.1"
+hex = "0.4.3"
 
 [profile.dev]
 codegen-units = 1

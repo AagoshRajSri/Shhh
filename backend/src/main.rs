@@ -2,7 +2,6 @@ use axum::{
     routing::{get, post, put},
     Router, Json, extract::State,
     extract::ws::{WebSocketUpgrade, WebSocket, Message as WsMessage},
-    extract::Query,
     response::Response,
     body::{Body, Bytes},
 };
@@ -18,11 +17,15 @@ use chrono::Utc;
 use axum::extract::ConnectInfo;
 use std::net::SocketAddr;
 
+use subtle::ConstantTimeEq;
+use axum::response::IntoResponse;
+
 // Type aliases for complex rate-limiter map types
 type HandleRateLimiter = Arc<Mutex<HashMap<String, (u32, chrono::DateTime<Utc>)>>>;
 type IpRateLimiter = Arc<Mutex<HashMap<std::net::IpAddr, (u32, chrono::DateTime<Utc>)>>>;
 type RegisterRateLimiter = Arc<Mutex<HashMap<std::net::IpAddr, (u32, chrono::DateTime<Utc>)>>>;
 type TokenRateLimiter = Arc<Mutex<HashMap<String, (u32, chrono::DateTime<Utc>)>>>;
+type FailedAuthLimiter = Arc<Mutex<HashMap<std::net::IpAddr, (u32, chrono::DateTime<Utc>)>>>;
 
 // --- DTOs ---
 #[derive(Deserialize, Serialize, Clone)]
@@ -34,20 +37,25 @@ struct RegisterRequest {
     kyber_public_key: String,
     /// Proof-of-work: SHA-256(nonce + handle) must begin with POW_DIFFICULTY leading zero bits.
     pow_nonce: Option<u64>,
+    /// Private 256-bit client-generated secret (64-char hex string).
+    /// Never returned by any endpoint or written to logs.
+    receive_secret: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct RegisterResponse {
     status: String,
-    routing_token: String,
+    inbox_id: String,
+    routing_token: String, // alias for inbox_id
     /// The actual handle stored (may have a random suffix appended on collision).
     assigned_handle: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct LookupResponse {
     status: String,
-    routing_token: String,
+    inbox_id: String,
+    routing_token: String, // alias for inbox_id
     identity_pubkey: String,
 }
 
@@ -58,8 +66,8 @@ struct SealedSenderEnvelope {
 }
 
 #[derive(Deserialize)]
-struct WsQuery {
-    token: Option<String>,
+struct AckRequest {
+    msg_id: String,
 }
 
 /// Minimum proof-of-work difficulty: SHA-256 hash must begin with this many zero bits.
@@ -83,6 +91,10 @@ struct AppState {
     global_lookup_limiter: Arc<Mutex<(u32, chrono::DateTime<Utc>)>>,
     /// Per-IP rate limit on /api/register to slow Sybil identity minting.
     register_rate_limiter: RegisterRateLimiter,
+    /// Rate limiter for failed authentication attempts (10 failed attempts / 60s per IP).
+    failed_auth_limiter: FailedAuthLimiter,
+    /// Global failed authentication attempts backstop.
+    global_failed_auth_limiter: Arc<Mutex<(u32, chrono::DateTime<Utc>)>>,
     #[allow(dead_code)]
     tor_mode: bool,
 }
@@ -170,6 +182,8 @@ async fn main() {
         token_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
         global_lookup_limiter: Arc::new(Mutex::new((0, Utc::now()))),
         register_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+        failed_auth_limiter: Arc::new(Mutex::new(HashMap::new())),
+        global_failed_auth_limiter: Arc::new(Mutex::new((0, Utc::now()))),
         tor_mode,
     });
 
@@ -179,6 +193,7 @@ async fn main() {
         .route("/health", get(|| async { "OK" }))
         .route("/api/register", post(register_handler))
         .route("/api/message", post(message_handler))
+        .route("/api/message/ack", post(ack_handler))
         .route("/api/lookup/:handle", get(lookup_handler))
         .route("/api/upload/init", post(upload_init_handler))
         .route("/api/upload/part/:hash/:upload_id/:part_number", put(upload_part_handler))
@@ -266,6 +281,127 @@ fn verify_pow(nonce: u64, handle: &str) -> bool {
     }
 }
 
+const RECV_DOMAIN_SEP: &[u8] = b"shhh-recv-v1";
+
+fn hash_receive_secret(secret_raw: &str) -> Result<[u8; 32], axum::http::StatusCode> {
+    let trimmed = secret_raw.trim();
+    let secret_bytes = if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        hex::decode(trimmed).map_err(|_| axum::http::StatusCode::UNAUTHORIZED)?
+    } else {
+        use base64::Engine;
+        b64.decode(trimmed)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
+            .map_err(|_| axum::http::StatusCode::UNAUTHORIZED)?
+    };
+
+    if secret_bytes.len() != 32 {
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(RECV_DOMAIN_SEP);
+    hasher.update(&secret_bytes);
+    let hash: [u8; 32] = hasher.finalize().into();
+    Ok(hash)
+}
+
+#[derive(Clone, Debug)]
+struct AuthenticatedUser {
+    #[allow(dead_code)]
+    id: uuid::Uuid,
+    inbox_id: uuid::Uuid,
+    #[allow(dead_code)]
+    handle: String,
+}
+
+async fn authenticate_receive_secret(
+    state: &Arc<AppState>,
+    secret_str: &str,
+    caller_ip: std::net::IpAddr,
+) -> Result<AuthenticatedUser, axum::http::StatusCode> {
+    let now = Utc::now();
+
+    // 1. Rate-limit failed auth attempts: max 10 failed attempts per 60s per IP
+    {
+        let rl = state.failed_auth_limiter.lock().await;
+        if let Some((count, window_start)) = rl.get(&caller_ip) {
+            if now.signed_duration_since(*window_start).num_seconds() <= 60 && *count >= 10 {
+                return Err(axum::http::StatusCode::TOO_MANY_REQUESTS);
+            }
+        }
+    }
+
+    // 2. Global failed auth limiter backstop: 2000 per 10s
+    {
+        let mut gl = state.global_failed_auth_limiter.lock().await;
+        if now.signed_duration_since(gl.1).num_seconds() > 10 {
+            gl.0 = 0;
+            gl.1 = now;
+        }
+        if gl.0 >= 2000 {
+            return Err(axum::http::StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
+    let record_failure = || async {
+        let mut rl = state.failed_auth_limiter.lock().await;
+        let entry = rl.entry(caller_ip).or_insert((0, now));
+        if now.signed_duration_since(entry.1).num_seconds() > 60 {
+            entry.0 = 0;
+            entry.1 = now;
+        }
+        entry.0 += 1;
+
+        let mut gl = state.global_failed_auth_limiter.lock().await;
+        gl.0 += 1;
+    };
+
+    let computed_hash = match hash_receive_secret(secret_str) {
+        Ok(h) => h,
+        Err(_) => {
+            record_failure().await;
+            return Err(axum::http::StatusCode::UNAUTHORIZED);
+        }
+    };
+
+    let record = sqlx::query(
+        "SELECT id, inbox_id, handle, receive_secret_hash, auth_scheme FROM users WHERE receive_secret_hash = $1"
+    )
+    .bind(&computed_hash[..])
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let row = match record {
+        Some(r) => r,
+        None => {
+            record_failure().await;
+            return Err(axum::http::StatusCode::UNAUTHORIZED);
+        }
+    };
+
+    let stored_hash: Vec<u8> = row.try_get("receive_secret_hash").unwrap_or_default();
+    let auth_scheme: String = row.try_get("auth_scheme").unwrap_or_default();
+
+    if auth_scheme != "hash-v1" || stored_hash.len() != 32 {
+        record_failure().await;
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    // Constant-time comparison
+    if !bool::from(computed_hash.ct_eq(&stored_hash[..])) {
+        record_failure().await;
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    let id: uuid::Uuid = row.try_get("id").unwrap_or_default();
+    let inbox_id: uuid::Uuid = row.try_get("inbox_id").unwrap_or_default();
+    let handle: String = row.try_get("handle").unwrap_or_default();
+
+    Ok(AuthenticatedUser { id, inbox_id, handle })
+}
+
 async fn register_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
@@ -283,10 +419,12 @@ async fn register_handler(
             entry.1 = now;
         }
         if entry.0 >= 5 {
-            // Return 200 with a fake token so probers can't distinguish rate-limit from success.
+            // Return 200 with a fake inbox_id so probers can't distinguish rate-limit from success.
+            let fake_id = uuid::Uuid::new_v4().to_string();
             return Ok(Json(RegisterResponse {
                 status: "success".to_string(),
-                routing_token: uuid::Uuid::new_v4().to_string(),
+                inbox_id: fake_id.clone(),
+                routing_token: fake_id,
                 assigned_handle: payload.handle.clone(),
             }));
         }
@@ -296,8 +434,6 @@ async fn register_handler(
     // 2. Proof-of-work verification.
     let nonce = payload.pow_nonce.unwrap_or(0);
     if !verify_pow(nonce, &payload.handle) {
-        // Return 400 for bad PoW so the client knows to retry with a valid nonce,
-        // but only leak that PoW failed, not whether the handle exists.
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
@@ -307,62 +443,66 @@ async fn register_handler(
         return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    // 4. Validate receive_secret: must be 256 bits (32 bytes).
+    let secret_hash = hash_receive_secret(&payload.receive_secret)
+        .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+
     let id_pubkey_bytes = b64.decode(&payload.identity_public_key).unwrap_or_default();
     let signed_prekey_bytes = b64.decode(&payload.signed_prekey).unwrap_or_default();
     let kyber_pubkey_bytes = b64.decode(&payload.kyber_public_key).unwrap_or_default();
     let created_week = Utc::now().naive_utc().date();
 
-    // 4. Try inserting with the requested handle. On collision, append a random 4-char suffix
-    //    and retry once. This prevents /api/register from being used as a handle-existence oracle
-    //    (a 409 would reveal the handle exists; now the caller cannot distinguish outcomes).
+    let inbox_id = uuid::Uuid::new_v4();
+
+    // 5. Try inserting with the requested handle. On collision, append a random 4-char suffix
+    //    and retry once.
     let mut actual_handle = payload.handle.clone();
     let mut result = sqlx::query(
-        "INSERT INTO users (handle, identity_pubkey, signed_prekey, kyber_pubkey, created_week)
-         VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        "INSERT INTO users (handle, identity_pubkey, signed_prekey, kyber_pubkey, created_week, inbox_id, receive_secret_hash, auth_scheme)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'hash-v1') RETURNING id, inbox_id",
     )
     .bind(&actual_handle)
     .bind(&id_pubkey_bytes)
     .bind(&signed_prekey_bytes)
     .bind(&kyber_pubkey_bytes)
     .bind(created_week)
+    .bind(inbox_id)
+    .bind(&secret_hash[..])
     .fetch_one(&state.pool)
     .await;
 
     if result.is_err() {
-        // Handle is taken. Assign a random suffix and retry.
         let suffix: String = uuid::Uuid::new_v4().simple().to_string()[..4].to_string();
         actual_handle = format!("{}_{}", payload.handle, suffix);
         result = sqlx::query(
-            "INSERT INTO users (handle, identity_pubkey, signed_prekey, kyber_pubkey, created_week)
-             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            "INSERT INTO users (handle, identity_pubkey, signed_prekey, kyber_pubkey, created_week, inbox_id, receive_secret_hash, auth_scheme)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'hash-v1') RETURNING id, inbox_id",
         )
         .bind(&actual_handle)
         .bind(&id_pubkey_bytes)
         .bind(&signed_prekey_bytes)
         .bind(&kyber_pubkey_bytes)
         .bind(created_week)
+        .bind(inbox_id)
+        .bind(&secret_hash[..])
         .fetch_one(&state.pool)
         .await;
     }
 
     match result {
         Ok(record) => {
-            let id: uuid::Uuid = record.try_get("id").unwrap_or_default();
+            let assigned_inbox_id: uuid::Uuid = record.try_get("inbox_id").unwrap_or(inbox_id);
             info!("Registered handle: {} (assigned: {})", payload.handle, actual_handle);
             Ok(Json(RegisterResponse {
                 status: "success".to_string(),
-                routing_token: id.to_string(),
+                inbox_id: assigned_inbox_id.to_string(),
+                routing_token: assigned_inbox_id.to_string(),
                 assigned_handle: actual_handle,
             }))
         }
         Err(e) => {
             error!("Failed to register user: {}", e);
-            // Always return 200 to prevent the caller from inferring db state.
-            Ok(Json(RegisterResponse {
-                status: "success".to_string(),
-                routing_token: uuid::Uuid::new_v4().to_string(),
-                assigned_handle: payload.handle.clone(),
-            }))
+            Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -370,16 +510,14 @@ async fn register_handler(
 async fn lookup_handler(
     axum::extract::Path(handle): axum::extract::Path<String>,
     headers: axum::http::HeaderMap,
-    ConnectInfo(_addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<LookupResponse>, axum::http::StatusCode> {
     let now = Utc::now();
 
-    // 1. Authenticate caller using X-Routing-Token or Authorization Bearer header.
-    // Requiring an identity token to lookup contacts eliminates the Tor enumeration hole
-    // because identity minting requires proof-of-work, attaching real cost to lookups.
-    let caller_token = headers
-        .get("X-Routing-Token")
+    // 1. Authenticate caller with their receive_secret
+    let caller_secret = headers
+        .get("X-Receive-Secret")
         .and_then(|v| v.to_str().ok())
         .or_else(|| {
             headers
@@ -387,30 +525,22 @@ async fn lookup_handler(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "))
         })
+        .or_else(|| {
+            headers
+                .get("X-Routing-Token")
+                .and_then(|v| v.to_str().ok())
+        })
         .map(|s| s.trim().to_string());
 
-    let token_str = match caller_token {
-        Some(t) => t,
-        None => return Err(axum::http::StatusCode::UNAUTHORIZED),
+    let secret_str = match caller_secret {
+        Some(s) if !s.is_empty() => s,
+        _ => return Err(axum::http::StatusCode::UNAUTHORIZED),
     };
 
-    let token_uuid = uuid::Uuid::parse_str(&token_str)
-        .map_err(|_| axum::http::StatusCode::UNAUTHORIZED)?;
-
-    let is_valid = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)",
-    )
-    .bind(token_uuid)
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(false);
-
-    if !is_valid {
-        return Err(axum::http::StatusCode::UNAUTHORIZED);
-    }
+    let auth_user = authenticate_receive_secret(&state, &secret_str, addr.ip()).await?;
+    let token_str = auth_user.inbox_id.to_string();
 
     // 2. Per-token rate limit: 30 lookups per 60s per identity.
-    // Eliminates per-handle DoS vectors (an attacker cannot lock out a victim's handle).
     {
         let mut rl = state.token_rate_limiter.lock().await;
         let entry = rl.entry(token_str).or_insert((0, now));
@@ -438,7 +568,7 @@ async fn lookup_handler(
     }
 
     let result = sqlx::query(
-        "SELECT id, identity_pubkey FROM users WHERE handle = $1",
+        "SELECT inbox_id, identity_pubkey FROM users WHERE handle = $1",
     )
     .bind(&handle)
     .fetch_optional(&state.pool)
@@ -446,11 +576,12 @@ async fn lookup_handler(
 
     match result {
         Ok(Some(record)) => {
-            let id: uuid::Uuid = record.try_get("id").unwrap_or_default();
+            let target_inbox_id: uuid::Uuid = record.try_get("inbox_id").unwrap_or_default();
             let identity_pubkey: Vec<u8> = record.try_get("identity_pubkey").unwrap_or_default();
             Ok(Json(LookupResponse {
                 status: "success".to_string(),
-                routing_token: id.to_string(),
+                inbox_id: target_inbox_id.to_string(),
+                routing_token: target_inbox_id.to_string(),
                 identity_pubkey: b64.encode(&identity_pubkey),
             }))
         }
@@ -471,6 +602,7 @@ async fn lookup_handler(
             
             Ok(Json(LookupResponse {
                 status: "success".to_string(),
+                inbox_id: fake_uuid.to_string(),
                 routing_token: fake_uuid.to_string(),
                 identity_pubkey: b64.encode(&pubkey_bytes),
             }))
@@ -483,10 +615,8 @@ async fn message_handler(
     State(state): State<Arc<AppState>>,
     Json(envelope): Json<SealedSenderEnvelope>,
 ) -> Json<serde_json::Value> {
-    info!("Received HTTP sealed envelope for routing token: {}", envelope.to_routing_token);
-    
     let msg_id = uuid::Uuid::new_v4().to_string();
-    let queue_key = format!("queue:{}", envelope.to_routing_token);
+    let queue_key = format!("msg_queue:{}", envelope.to_routing_token);
     
     let mut conn = state.redis_conn.clone();
     let res: Result<(), _> = redis::pipe()
@@ -507,26 +637,84 @@ async fn message_handler(
     Json(serde_json::json!({ "status": "queued" }))
 }
 
+// HTTP message ack route
+async fn ack_handler(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<AckRequest>,
+) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+    let secret = headers
+        .get("X-Receive-Secret")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+        })
+        .or_else(|| {
+            headers
+                .get("X-Routing-Token")
+                .and_then(|v| v.to_str().ok())
+        })
+        .map(|s| s.trim())
+        .unwrap_or_default();
+
+    if secret.is_empty() {
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    let auth_user = authenticate_receive_secret(&state, secret, addr.ip()).await?;
+    let queue_key = format!("msg_queue:{}", auth_user.inbox_id);
+    let mut conn = state.redis_conn.clone();
+    let _: () = redis::cmd("HDEL")
+        .arg(&queue_key)
+        .arg(&payload.msg_id)
+        .query_async(&mut conn)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({ "status": "acknowledged" })))
+}
+
 // WebSocket Route
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    Query(query): Query<WsQuery>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
-    let mut token = query.token.unwrap_or_default();
-    if token.is_empty() {
-        token = headers.get("sec-websocket-protocol")
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+    // Secret travels ONLY in Sec-WebSocket-Protocol. Query fallback is completely removed.
+    let subprotocols = headers.get("sec-websocket-protocol")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+
+    let secret = subprotocols
+        .split(',')
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
+
+    if secret.is_empty() {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
     }
-    info!("WS Connection attempt for token: {}", token);
-    ws.protocols([token.clone()]).on_upgrade(move |socket| handle_socket(socket, token, state))
+
+    let auth_user = match authenticate_receive_secret(&state, secret, addr.ip()).await {
+        Ok(u) => u,
+        Err(status) => return status.into_response(),
+    };
+
+    let selected_proto = secret.to_string();
+    let inbox_id_str = auth_user.inbox_id.to_string();
+
+    ws.protocols([selected_proto]).on_upgrade(move |socket| {
+        handle_socket(socket, inbox_id_str, state)
+    })
 }
 
-async fn flush_queue(token: &str, socket: &mut WebSocket, mut redis_conn: redis::aio::MultiplexedConnection) -> bool {
-    let queue_key = format!("queue:{}", token);
+async fn flush_queue(inbox_id: &str, socket: &mut WebSocket, mut redis_conn: redis::aio::MultiplexedConnection) -> bool {
+    let queue_key = format!("msg_queue:{}", inbox_id);
     let query_result: Result<HashMap<String, String>, _> = redis::cmd("HGETALL").arg(&queue_key).query_async(&mut redis_conn).await;
     if let Ok(items) = query_result {
         for (msg_id, payload) in items {
@@ -542,18 +730,20 @@ async fn flush_queue(token: &str, socket: &mut WebSocket, mut redis_conn: redis:
     true
 }
 
-async fn handle_socket(mut socket: WebSocket, token: String, state: Arc<AppState>) {
+async fn handle_socket(mut socket: WebSocket, inbox_id: String, state: Arc<AppState>) {
     let (tx, mut rx) = broadcast::channel(100);
     
     {
         let mut conns = state.active_connections.lock().await;
-        conns.insert(token.clone(), tx);
+        conns.insert(inbox_id.clone(), tx);
     }
 
-    info!("WS Connected successfully for token: {}", token);
+    info!("WS client connected successfully");
     
     // Flush immediately on connect
-    if !flush_queue(&token, &mut socket, state.redis_conn.clone()).await {
+    if !flush_queue(&inbox_id, &mut socket, state.redis_conn.clone()).await {
+        let mut conns = state.active_connections.lock().await;
+        conns.remove(&inbox_id);
         return;
     }
 
@@ -563,7 +753,7 @@ async fn handle_socket(mut socket: WebSocket, token: String, state: Arc<AppState
                 match result {
                     Ok(msg) => {
                         if msg == "WAKE" {
-                            if !flush_queue(&token, &mut socket, state.redis_conn.clone()).await {
+                            if !flush_queue(&inbox_id, &mut socket, state.redis_conn.clone()).await {
                                 break;
                             }
                         } else {
@@ -576,8 +766,7 @@ async fn handle_socket(mut socket: WebSocket, token: String, state: Arc<AppState
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Just missed some WAKE messages, flush queue anyway
-                        if !flush_queue(&token, &mut socket, state.redis_conn.clone()).await {
+                        if !flush_queue(&inbox_id, &mut socket, state.redis_conn.clone()).await {
                             break;
                         }
                     }
@@ -588,10 +777,8 @@ async fn handle_socket(mut socket: WebSocket, token: String, state: Arc<AppState
                 match result {
                     Some(Ok(WsMessage::Text(text))) => {
                         if let Ok(envelope) = serde_json::from_str::<SealedSenderEnvelope>(&text) {
-                            info!("Routing WS message to: {}", envelope.to_routing_token);
-                            
                             let msg_id = uuid::Uuid::new_v4().to_string();
-                            let queue_key = format!("queue:{}", envelope.to_routing_token);
+                            let queue_key = format!("msg_queue:{}", envelope.to_routing_token);
                             
                             let mut conn = state.redis_conn.clone();
                             let _: () = redis::pipe()
@@ -607,7 +794,7 @@ async fn handle_socket(mut socket: WebSocket, token: String, state: Arc<AppState
                         } else if let Ok(ack) = serde_json::from_str::<serde_json::Value>(&text) {
                             if ack["type"] == "ack" {
                                 if let Some(msg_id) = ack["msg_id"].as_str() {
-                                    let queue_key = format!("queue:{}", token);
+                                    let queue_key = format!("msg_queue:{}", inbox_id);
                                     let mut conn = state.redis_conn.clone();
                                     let _: () = redis::cmd("HDEL").arg(&queue_key).arg(msg_id).query_async(&mut conn).await.unwrap_or(());
                                 }
@@ -623,9 +810,9 @@ async fn handle_socket(mut socket: WebSocket, token: String, state: Arc<AppState
         }
     }
 
-    info!("WS Disconnected for token: {}", token);
+    info!("WS client disconnected");
     let mut conns = state.active_connections.lock().await;
-    conns.remove(&token);
+    conns.remove(&inbox_id);
 }
 
 // --- Media Upload Routes (Proxied via Relay for Tor & Clearnet compatibility) ---
@@ -786,45 +973,42 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     async fn setup_test_state() -> Option<Arc<AppState>> {
+        // If SKIP_INTEGRATION=1, silently skip service-dependent tests.
+        // CI must never set this variable.
+        if std::env::var("SKIP_INTEGRATION").as_deref() == Ok("1") {
+            eprintln!("[SKIP] SKIP_INTEGRATION=1 set; skipping integration test.");
+            return None;
+        }
+
         dotenvy::dotenv().ok();
         let db_conn_string = std::env::var("DATABASE_URL")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "postgres://securechat:CHANGEME@localhost:5432/securechat".to_string());
-        let pool = match tokio::time::timeout(
-            std::time::Duration::from_millis(1500),
+        let pool = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
             PgPool::connect(&db_conn_string)
-        ).await {
-            Ok(Ok(p)) => p,
-            _ => {
-                eprintln!("Postgres offline; skipping integration test.");
-                return None;
-            }
-        };
-        
-        if sqlx::migrate!("./migrations").run(&pool).await.is_err() {
-            eprintln!("Migrations failed; skipping integration test.");
-            return None;
-        }
+        ).await
+            .expect("Postgres connection timed out — is Docker running?")
+            .expect("Failed to connect to Postgres — is Docker running?");
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Migrations failed");
 
         let redis_conn_string = std::env::var("REDIS_URL")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "redis://:CHANGEME@localhost:6379".to_string());
-        let redis_client = match redis::Client::open(redis_conn_string) {
-            Ok(c) => c,
-            Err(_) => return None,
-        };
-        let redis_conn = match tokio::time::timeout(
-            std::time::Duration::from_millis(1500),
+        let redis_client = redis::Client::open(redis_conn_string)
+            .expect("Invalid Redis URL");
+        let redis_conn = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
             redis_client.get_multiplexed_async_connection()
-        ).await {
-            Ok(Ok(c)) => c,
-            _ => {
-                eprintln!("Redis offline; skipping integration test.");
-                return None;
-            }
-        };
+        ).await
+            .expect("Redis connection timed out — is Docker running?")
+            .expect("Failed to connect to Redis — is Docker running?");
 
         let s3_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .endpoint_url("http://localhost:9000")
@@ -847,18 +1031,30 @@ mod tests {
             token_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             global_lookup_limiter: Arc::new(Mutex::new((0, Utc::now()))),
             register_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            failed_auth_limiter: Arc::new(Mutex::new(HashMap::new())),
+            global_failed_auth_limiter: Arc::new(Mutex::new((0, Utc::now()))),
             tor_mode: false,
         }))
     }
 
     fn dummy_connect_info() -> ConnectInfo<SocketAddr> {
-        ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080))
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static IP_SUFFIX: AtomicU8 = AtomicU8::new(2);
+        let s = IP_SUFFIX.fetch_add(1, Ordering::Relaxed);
+        ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, s)), 8080))
     }
 
-    fn auth_headers(token: &str) -> axum::http::HeaderMap {
+    fn auth_headers(secret: &str) -> axum::http::HeaderMap {
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert("X-Routing-Token", token.parse().unwrap());
+        headers.insert("X-Receive-Secret", secret.parse().unwrap());
         headers
+    }
+
+    fn test_secret(_seed: u8) -> String {
+        let mut bytes = [0u8; 32];
+        bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        hex::encode(bytes)
     }
 
     #[tokio::test]
@@ -867,7 +1063,8 @@ mod tests {
             Some(s) => s,
             None => return,
         };
-        let test_handle = format!("#durability_user_{}", uuid::Uuid::new_v4().simple());
+        let test_handle = format!("#dur_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let secret = test_secret(1);
 
         let req = RegisterRequest {
             handle: test_handle.clone(),
@@ -876,11 +1073,13 @@ mod tests {
             one_time_prekeys: vec![b64.encode(b"otpk1")],
             kyber_public_key: b64.encode(b"kyber_prekey"),
             pow_nonce: Some(0),
+            receive_secret: secret.clone(),
         };
 
         let reg_res = register_handler(dummy_connect_info(), State(state.clone()), Json(req)).await.expect("Registration failed");
-        let routing_token = reg_res.routing_token.clone();
-        assert!(!routing_token.is_empty());
+        let inbox_id = reg_res.inbox_id.clone();
+        assert!(!inbox_id.is_empty());
+        assert_ne!(inbox_id, secret);
 
         drop(state);
         let restarted_state = match setup_test_state().await {
@@ -888,9 +1087,9 @@ mod tests {
             None => return,
         };
 
-        let lookup_res = lookup_handler(Path(test_handle), auth_headers(&routing_token), dummy_connect_info(), State(restarted_state)).await.unwrap();
+        let lookup_res = lookup_handler(Path(test_handle), auth_headers(&secret), dummy_connect_info(), State(restarted_state)).await.unwrap();
         assert_eq!(lookup_res.status, "success");
-        assert_eq!(lookup_res.routing_token, routing_token);
+        assert_eq!(lookup_res.inbox_id, inbox_id);
         assert_eq!(lookup_res.identity_pubkey, b64.encode(b"test_identity_key"));
     }
 
@@ -900,7 +1099,7 @@ mod tests {
             Some(s) => s,
             None => return,
         };
-        let test_handle = format!("#unique_user_{}", uuid::Uuid::new_v4().simple());
+        let test_handle = format!("#uniq_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
 
         let req = RegisterRequest {
             handle: test_handle.clone(),
@@ -909,6 +1108,7 @@ mod tests {
             one_time_prekeys: vec![],
             kyber_public_key: b64.encode(b"kyber_key"),
             pow_nonce: Some(0),
+            receive_secret: test_secret(2),
         };
 
         let res1 = register_handler(dummy_connect_info(), State(state.clone()), Json(req.clone())).await;
@@ -916,8 +1116,6 @@ mod tests {
         let res1_data = res1.unwrap().0;
         assert_eq!(res1_data.assigned_handle, test_handle);
 
-        // A second registration with the same handle must not leak handle existence with 409 Conflict.
-        // Instead, the server assigns a random suffix and succeeds.
         let res2 = register_handler(dummy_connect_info(), State(state), Json(req)).await;
         assert!(res2.is_ok());
         let res2_data = res2.unwrap().0;
@@ -927,7 +1125,6 @@ mod tests {
 
     #[test]
     fn test_verify_pow_difficulty_logic() {
-        // Difficulty 4: first byte must have upper 4 bits zero (byte < 0x10)
         let handle = "#test_pow_verification";
         let mut found_nonce = None;
         for nonce in 0..10_000u64 {
@@ -946,12 +1143,12 @@ mod tests {
             Some(s) => s,
             None => return,
         };
-        let fake_token = uuid::Uuid::new_v4().to_string();
+        let fake_inbox_id = uuid::Uuid::new_v4().to_string();
         let (tx, _) = broadcast::channel(10);
         
         {
             let mut conns = state.active_connections.lock().await;
-            conns.insert(fake_token.clone(), tx);
+            conns.insert(fake_inbox_id.clone(), tx);
         }
 
         drop(state);
@@ -961,7 +1158,7 @@ mod tests {
         };
         
         let conns = fresh_state.active_connections.lock().await;
-        assert!(!conns.contains_key(&fake_token));
+        assert!(!conns.contains_key(&fake_inbox_id));
         assert!(conns.is_empty());
     }
 
@@ -976,8 +1173,9 @@ mod tests {
         let unauth = lookup_handler(Path("#some_handle".to_string()), axum::http::HeaderMap::new(), dummy_connect_info(), State(state.clone())).await;
         assert_eq!(unauth.err().unwrap(), axum::http::StatusCode::UNAUTHORIZED);
 
-        // Register a user to get a valid token
-        let test_handle = format!("#ratelimit_user_{}", uuid::Uuid::new_v4().simple());
+        // Register a user to get a valid receive_secret
+        let test_handle = format!("#rl_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let secret = test_secret(3);
         let req = RegisterRequest {
             handle: test_handle.clone(),
             identity_public_key: b64.encode(b"test_identity_key"),
@@ -985,18 +1183,18 @@ mod tests {
             one_time_prekeys: vec![],
             kyber_public_key: b64.encode(b"kyber_key"),
             pow_nonce: Some(0),
+            receive_secret: secret.clone(),
         };
-        let reg_res = register_handler(dummy_connect_info(), State(state.clone()), Json(req)).await.unwrap();
-        let token = reg_res.routing_token.clone();
+        let _ = register_handler(dummy_connect_info(), State(state.clone()), Json(req)).await.unwrap();
 
-        // 30 requests should succeed per token
+        // 30 requests should succeed per identity
         for _ in 0..30 {
-            let res = lookup_handler(Path("#some_handle".to_string()), auth_headers(&token), dummy_connect_info(), State(state.clone())).await;
+            let res = lookup_handler(Path("#some_handle".to_string()), auth_headers(&secret), dummy_connect_info(), State(state.clone())).await;
             assert!(res.is_ok());
         }
         
         // 31st should be rate limited
-        let res = lookup_handler(Path("#some_handle".to_string()), auth_headers(&token), dummy_connect_info(), State(state.clone())).await;
+        let res = lookup_handler(Path("#some_handle".to_string()), auth_headers(&secret), dummy_connect_info(), State(state.clone())).await;
         assert!(res.is_err());
         assert_eq!(res.err().unwrap(), axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
@@ -1019,6 +1217,176 @@ mod tests {
         // 31st request hits limit
         let entry = rl.entry(token.clone()).or_insert((0, now));
         assert!(entry.0 >= 30, "Rate limiter did not block on 31st request!");
+    }
+
+    // --- PHASE 1 NEGATIVE SECURITY TESTS ---
+
+    #[tokio::test]
+    async fn test_inbox_id_cannot_open_ws() {
+        let state = match setup_test_state().await {
+            Some(s) => s,
+            None => return,
+        };
+        let handle = format!("#neg_ws_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let secret = test_secret(10);
+        let reg_req = RegisterRequest {
+            handle,
+            identity_public_key: b64.encode(b"pubkey"),
+            signed_prekey: b64.encode(b"prekey"),
+            one_time_prekeys: vec![],
+            kyber_public_key: b64.encode(b"kyber"),
+            pow_nonce: Some(0),
+            receive_secret: secret.clone(),
+        };
+        let reg = register_handler(dummy_connect_info(), State(state.clone()), Json(reg_req)).await.unwrap().0;
+        let alice_inbox_id = reg.inbox_id;
+
+        // Attacker attempts WS authentication holding ONLY Alice's inbox_id
+        let auth_result = authenticate_receive_secret(&state, &alice_inbox_id, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).await;
+        assert!(auth_result.is_err(), "Attacker holding only inbox_id must NOT authenticate!");
+        assert_eq!(auth_result.unwrap_err(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // Genuine owner holding receive_secret authenticates successfully
+        let genuine_auth = authenticate_receive_secret(&state, &secret, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).await;
+        assert!(genuine_auth.is_ok(), "Genuine secret holder must authenticate");
+        assert_eq!(genuine_auth.unwrap().inbox_id.to_string(), alice_inbox_id);
+    }
+
+    #[tokio::test]
+    async fn test_ack_wrong_or_missing_secret_does_not_delete() {
+        let state = match setup_test_state().await {
+            Some(s) => s,
+            None => return,
+        };
+        let handle = format!("#neg_ack_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let secret = test_secret(20);
+        let reg_req = RegisterRequest {
+            handle,
+            identity_public_key: b64.encode(b"pubkey"),
+            signed_prekey: b64.encode(b"prekey"),
+            one_time_prekeys: vec![],
+            kyber_public_key: b64.encode(b"kyber"),
+            pow_nonce: Some(0),
+            receive_secret: secret.clone(),
+        };
+        let reg = register_handler(dummy_connect_info(), State(state.clone()), Json(reg_req)).await.unwrap().0;
+        let alice_inbox_id = reg.inbox_id;
+
+        // Push a test message into Alice's Redis queue
+        let msg_id = "test_msg_12345";
+        let queue_key = format!("msg_queue:{}", alice_inbox_id);
+        let mut conn = state.redis_conn.clone();
+        let _: () = redis::cmd("HSET")
+            .arg(&queue_key)
+            .arg(msg_id)
+            .arg("encrypted_payload_bytes")
+            .query_async(&mut conn)
+            .await
+            .expect("Failed to seed Redis queue");
+
+        // 1. Attack: Ack with MISSING secret
+        let ack_req = AckRequest { msg_id: msg_id.to_string() };
+        let res_missing = ack_handler(dummy_connect_info(), State(state.clone()), axum::http::HeaderMap::new(), Json(ack_req)).await;
+        assert_eq!(res_missing.unwrap_err(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // Verify message is STILL in Redis
+        let exists: bool = redis::cmd("HEXISTS").arg(&queue_key).arg(msg_id).query_async(&mut conn).await.unwrap();
+        assert!(exists, "Message was deleted on missing secret ack!");
+
+        // 2. Attack: Ack with WRONG secret
+        let wrong_secret = test_secret(99);
+        let ack_req = AckRequest { msg_id: msg_id.to_string() };
+        let res_wrong = ack_handler(dummy_connect_info(), State(state.clone()), auth_headers(&wrong_secret), Json(ack_req)).await;
+        assert_eq!(res_wrong.unwrap_err(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let exists: bool = redis::cmd("HEXISTS").arg(&queue_key).arg(msg_id).query_async(&mut conn).await.unwrap();
+        assert!(exists, "Message was deleted on wrong secret ack!");
+
+        // 3. Attack: Ack using Alice's public inbox_id instead of secret
+        let ack_req = AckRequest { msg_id: msg_id.to_string() };
+        let res_inbox = ack_handler(dummy_connect_info(), State(state.clone()), auth_headers(&alice_inbox_id), Json(ack_req)).await;
+        assert_eq!(res_inbox.unwrap_err(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let exists: bool = redis::cmd("HEXISTS").arg(&queue_key).arg(msg_id).query_async(&mut conn).await.unwrap();
+        assert!(exists, "Message was deleted using inbox_id!");
+
+        // 4. Legitimate: Ack with Alice's GENUINE secret
+        let ack_req = AckRequest { msg_id: msg_id.to_string() };
+        let res_legit = ack_handler(dummy_connect_info(), State(state.clone()), auth_headers(&secret), Json(ack_req)).await;
+        assert!(res_legit.is_ok(), "Legitimate ack must succeed");
+
+        let exists: bool = redis::cmd("HEXISTS").arg(&queue_key).arg(msg_id).query_async(&mut conn).await.unwrap();
+        assert!(!exists, "Message must be deleted after legitimate ack!");
+    }
+
+    #[tokio::test]
+    async fn test_lookup_with_inbox_id_returns_401() {
+        let state = match setup_test_state().await {
+            Some(s) => s,
+            None => return,
+        };
+        let handle = format!("#neg_lk_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let secret = test_secret(30);
+        let reg_req = RegisterRequest {
+            handle: handle.clone(),
+            identity_public_key: b64.encode(b"pubkey"),
+            signed_prekey: b64.encode(b"prekey"),
+            one_time_prekeys: vec![],
+            kyber_public_key: b64.encode(b"kyber"),
+            pow_nonce: Some(0),
+            receive_secret: secret,
+        };
+        let reg = register_handler(dummy_connect_info(), State(state.clone()), Json(reg_req)).await.unwrap().0;
+        let alice_inbox_id = reg.inbox_id;
+
+        // Attacker attempts to use Alice's inbox_id as the lookup auth credential
+        let res = lookup_handler(Path(handle), auth_headers(&alice_inbox_id), dummy_connect_info(), State(state)).await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_responses_and_logs_never_contain_receive_secret() {
+        let state = match setup_test_state().await {
+            Some(s) => s,
+            None => return,
+        };
+        let handle = format!("#neg_sec_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let secret = test_secret(40);
+        let reg_req = RegisterRequest {
+            handle: handle.clone(),
+            identity_public_key: b64.encode(b"pubkey"),
+            signed_prekey: b64.encode(b"prekey"),
+            one_time_prekeys: vec![],
+            kyber_public_key: b64.encode(b"kyber"),
+            pow_nonce: Some(0),
+            receive_secret: secret.clone(),
+        };
+
+        let reg_resp = register_handler(dummy_connect_info(), State(state.clone()), Json(reg_req)).await.unwrap().0;
+        let reg_json = serde_json::to_string(&reg_resp).unwrap();
+
+        // 1. RegisterResponse MUST NOT contain receive_secret or its hash
+        assert!(!reg_json.contains(&secret), "RegisterResponse must not leak receive_secret!");
+        assert_ne!(reg_resp.inbox_id, secret);
+
+        // 2. LookupResponse MUST NOT contain receive_secret or its hash
+        let lookup_resp = lookup_handler(Path(handle.clone()), auth_headers(&secret), dummy_connect_info(), State(state.clone())).await.unwrap().0;
+        let lookup_json = serde_json::to_string(&lookup_resp).unwrap();
+        assert!(!lookup_json.contains(&secret), "LookupResponse must not leak receive_secret!");
+
+        // 3. Database MUST NOT contain receive_secret in plaintext
+        let row = sqlx::query("SELECT * FROM users WHERE handle = $1")
+            .bind(&reg_resp.assigned_handle)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+        let raw_hash: Vec<u8> = row.try_get("receive_secret_hash").unwrap();
+        let auth_scheme: String = row.try_get("auth_scheme").unwrap();
+        assert_eq!(auth_scheme, "hash-v1");
+        assert_eq!(raw_hash.len(), 32);
+        assert_ne!(hex::encode(&raw_hash), secret, "Database must store the SHA-256 hash, never the plaintext secret!");
     }
 }
 

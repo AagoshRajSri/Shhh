@@ -4,19 +4,21 @@
 
 ## Features
 - **End-to-End Encryption:** ECIES with AES-GCM and ephemeral ECDH (X25519).
+- **Split Routing Token:** Public delivery address (`inbox_id`, 128-bit UUID) is separated from private client-generated credentials (`receive_secret`, 256-bit). The server stores only SHA-256 hashes compared in constant time (`subtle::ConstantTimeEq`).
+- **Subprotocol WebSocket Auth:** WebSocket authentication exclusively travels in the `Sec-WebSocket-Protocol` header, keeping secrets completely out of URLs, query parameters, and access logs.
 - **Zero-Knowledge Identity:** Sender authentication via independently verified ECDSA P-256 signatures. Provides a mechanism to detect server-side impersonation, when used.
 - **Robust Replay Protection:** Per-message UUID nonce deduplication with a strict 7-day TTL window (synchronized securely across browser tabs via Web Locks API).
 - **Proof-of-Work Registration:** Client-side PoW difficulty challenge to mitigate automated handle registration and Sybil attacks.
-- **Identity Vault:** Password-protected identity key backup and export using Argon2id key derivation.
+- **Identity Vault:** Password-protected identity key and secret backup/export using Argon2id key derivation.
 - **Encrypted Media:** Client-side convergent encryption (ChaCha20-Poly1305) for attachments, chunked securely to a self-hosted S3-compatible backend (MinIO).
-- **Ephemeral Rate Limiting:** IP-based and handle-based limiters to prevent global and targeted enumeration attacks.
+- **Ephemeral Rate Limiting:** IP-based, token-based, and handle-based limiters to prevent global and targeted enumeration attacks.
 
 ## Architecture
 - **Frontend:** React, TypeScript, Tailwind CSS, Vite. Cryptography is handled natively via the Web Crypto API.
 - **Backend:** Rust, Axum, Tokio. Fast, memory-safe, and asynchronous WebSocket relay.
 - **Storage:** 
-  - **PostgreSQL:** For persisting public keys and routing identities.
-  - **Redis:** For the offline message queue (7-day TTL).
+  - **PostgreSQL:** For persisting public keys, routing identities (`inbox_id`), and hashed credentials (`receive_secret_hash`).
+  - **Redis:** For transient offline message queues (`msg_queue:{inbox_id}`) with 7-day TTL.
   - **MinIO:** For encrypted media attachment blobs.
 
 ### Deployment & Scaling Constraints
@@ -26,6 +28,19 @@
 - Docker & Docker Compose
 - Rust (Cargo) & `dotenvy`
 - Node.js & npm
+
+### Browser Requirements
+Shhh requires `crypto.subtle` with **X25519** (ECDH) and **ECDSA P-256** (signing). The app performs a startup check and shows a clear error screen if these are unavailable.
+
+| Client | Minimum version | Notes |
+|---|---|---|
+| **Tor Browser** | **13.5** (Firefox ESR 115+) | Required for X25519 in `crypto.subtle` |
+| Chrome / Edge | 130+ | Full support |
+| Firefox | 133+ | Full support |
+| Safari | 17+ | Full support |
+
+> [!IMPORTANT]
+> Shhh is designed and tested for use over **Tor Browser** on a `.onion` address. Running over clearnet reduces your anonymity. `crypto.subtle` is only available in secure contexts (HTTPS or `.onion`).
 
 ## Getting Started
 
@@ -68,13 +83,19 @@ cargo test --manifest-path backend/Cargo.toml
 npm --prefix frontend run build
 ```
 
-## Security Model
+## Security Model & Limitations
 Shhh is built on the principle of **Trust-On-First-Use (TOFU)** augmented with out-of-band verification. 
 
 Inside an active chat, click on the remote user's handle to reveal the **Safety Number**. Compare this 60-digit fingerprint with your contact over a secure, out-of-band channel (e.g., in person or a trusted video call). If the numbers match, you are guaranteed that no Man-In-The-Middle (MITM) attack or server-side key impersonation has occurred.
 
+### Known Limitations & Project Status
+- **Pre-Audit & Self-Reviewed:** This software is pre-audit and actively undergoing self-reviewed hardening. It has not undergone an independent third-party cryptographic review.
+- **Recipient-Routed Transport:** The relay is recipient-routed via public `inbox_id`. While message envelopes are end-to-end encrypted (E2EE) and cannot be decrypted by the server, the relay can observe which WebSocket connection sends to which recipient `inbox_id`. Sealed sender (anonymous routing) is not implemented.
+- **Single-Instance Relay:** Active connections and rate limiters reside in server memory, requiring deployment as a single instance.
+- **Forward Secrecy:** Key rotation is performed at rotation granularity; per-message forward secrecy (Double Ratchet) is planned in the cryptographic roadmap.
+
 ## Legal & Transparency
-Shhh is designed around the principles of privacy and minimal data collection. Because the application utilizes true End-to-End Encryption (E2EE) and sealed sender routing, the server does not possess the cryptographic keys required to decrypt message contents or media. 
+Shhh is designed around the principles of privacy and minimal data collection. Because the application utilizes End-to-End Encryption (E2EE), the server does not possess the cryptographic keys required to decrypt message contents or media. 
 * We do not collect traditional Personally Identifiable Information (PII) such as names, emails, or phone numbers. 
 * This project is open-source to allow for public audit and reproducible builds, ensuring transparency in how data is (and isn't) handled.
 

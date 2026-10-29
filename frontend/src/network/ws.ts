@@ -18,20 +18,18 @@ export class WSService {
   private isConnecting = false;
   private reconnectTimer: any = null;
 
-  connect(routingToken: string) {
+  connect(receiveSecret: string) {
     if (this.ws?.readyState === WebSocket.OPEN || this.isConnecting) return;
     this.isConnecting = true;
 
     // Use dynamic WS URL from environment or current origin
     const WS_URL = getWsUrl();
-    console.log(`Connecting to Relay via WebSocket: ${WS_URL}`);
     
-    // Pass routing token as a subprotocol to avoid leaking it in URLs
-    this.ws = new WebSocket(WS_URL, [routingToken]);
+    // Pass receive_secret as Sec-WebSocket-Protocol subprotocol
+    this.ws = new WebSocket(WS_URL, [receiveSecret]);
 
     this.ws.onopen = () => {
       this.isConnecting = false;
-      console.log('WebSocket connected securely to Relay');
       if (this.reconnectTimer) {
         clearTimeout(this.reconnectTimer);
         this.reconnectTimer = null;
@@ -63,8 +61,7 @@ export class WSService {
     this.ws.onclose = () => {
       this.isConnecting = false;
       this.ws = null;
-      console.log('WebSocket disconnected. Reconnecting in 3s...');
-      this.reconnectTimer = setTimeout(() => this.connect(routingToken), 3000);
+      this.reconnectTimer = setTimeout(() => this.connect(receiveSecret), 3000);
     };
 
     this.ws.onerror = (err) => {
