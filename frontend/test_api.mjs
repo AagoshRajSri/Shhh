@@ -35,7 +35,7 @@ async function run() {
         one_time_prekeys: [],
         kyber_public_key: Buffer.from('kyber').toString('base64') // gitleaks:allow
     };
-    let routingToken;
+    let inboxId;
 
     // 2. Register
     await test('POST /api/register', async () => {
@@ -45,8 +45,8 @@ async function run() {
             body: JSON.stringify(body)
         });
         const data = await res.json();
-        routingToken = data.inbox_id;
-        return { pass: data.status === 'success' && !!routingToken, detail: `inbox_id=${routingToken}` };
+        inboxId = data.inbox_id;
+        return { pass: data.status === 'success' && !!inboxId, detail: `inbox_id=${inboxId}` };
     });
 
     // 3. Duplicate
@@ -63,7 +63,7 @@ async function run() {
     await test('GET /api/lookup (exists)', async () => {
         const res = await fetch(`${baseUrl}/api/lookup/${encodeURIComponent(handle)}`);
         const data = await res.json();
-        return { pass: data.inbox_id === routingToken, detail: `inbox_id_match=${data.inbox_id === routingToken}` };
+        return { pass: data.inbox_id === inboxId, detail: `inbox_id_match=${data.inbox_id === inboxId}` };
     });
 
     // 5. Ghost
@@ -91,11 +91,11 @@ async function run() {
 
     // 7. Message
     await test('POST /api/message (envelope)', async () => {
-        if (!routingToken) throw new Error('No routing token');
+        if (!inboxId) throw new Error('No inbox_id');
         const res = await fetch(`${baseUrl}/api/message`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ to_inbox_id: routingToken, encrypted_payload: 'test' })
+            body: JSON.stringify({ to_inbox_id: inboxId, encrypted_payload: 'test' })
         });
         const data = await res.json();
         return { pass: data.status === 'queued', detail: data.status };

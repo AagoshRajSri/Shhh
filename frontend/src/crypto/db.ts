@@ -40,8 +40,8 @@ interface SecureChatDB extends DBSchema {
 let dbPromise: Promise<IDBPDatabase<SecureChatDB>>;
 
 export function initDB() {
-  dbPromise = openDB<SecureChatDB>('securechat-db', 2, {
-    upgrade(db, oldVersion) {
+  dbPromise = openDB<SecureChatDB>('securechat-db', 3, {
+    upgrade(db, oldVersion, _newVersion, tx) {
       if (oldVersion < 1) {
         db.createObjectStore('identity', { keyPath: 'id' });
         db.createObjectStore('sessions', { keyPath: 'address' });
@@ -49,6 +49,13 @@ export function initDB() {
       }
       if (oldVersion < 2) {
         db.createObjectStore('knownKeys', { keyPath: 'address' });
+      }
+      if (oldVersion < 3) {
+        // Migration 20261030000000 truncated the server users table, invalidating
+        // all pre-v3 sessions and cached identities. Clear the identity store to
+        // purge old keys and prevent any legacy name from lingering.
+        const store = tx.objectStore('identity');
+        store.clear();
       }
     },
   });
@@ -232,7 +239,7 @@ async function deriveKeyFromPassphrase(passphrase: string, saltHex: string): Pro
  */
 export async function exportIdentity(
   handle: string,
-  routingToken: string,
+  inboxId: string,
   passphrase: string,
   receiveSecret?: string,
 ): Promise<string> {
@@ -260,7 +267,7 @@ export async function exportIdentity(
 
   const plaintext = JSON.stringify({
     handle,
-    inbox_id: routingToken,
+    inbox_id: inboxId,
     receive_secret: secret,
     identity,
     seenNonces,
@@ -297,7 +304,7 @@ export async function importIdentity(fileContent: string, passphrase: string): P
     throw new Error('Incorrect passphrase or corrupted backup file.');
   }
 
-  const inboxId = data.inbox_id || data.routing_token;
+  const inboxId = data.inbox_id;
   if (!data.identity || !data.handle || !inboxId) {
     throw new Error('Backup file is missing required fields.');
   }
@@ -306,7 +313,7 @@ export async function importIdentity(fileContent: string, passphrase: string): P
   if (data.receive_secret) {
     await saveEncrypted('identity', { receiveSecret: data.receive_secret }, 'receive_secret');
   }
-  await saveEncrypted('identity', { routingToken: inboxId, inboxId, handle: data.handle }, 'routing_token');
+  await saveEncrypted('identity', { inboxId, handle: data.handle }, 'identity_record');
 
   if (data.seenNonces && Object.keys(data.seenNonces).length > 0) {
     await saveEncrypted('identity', data.seenNonces, 'seen_nonces');

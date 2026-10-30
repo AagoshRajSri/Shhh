@@ -342,11 +342,11 @@ export class SignalService {
       if (cached && cached.keyB64) {
         identityPubkey = cached.keyB64;
       } else {
-        // Fetch from relay passing authenticated routing token if available
-        const tokenRec = await loadEncrypted('identity', 'routing_token');
+        // Fetch from relay passing authenticated receive_secret if available
+        const secRec = await loadEncrypted('identity', 'receive_secret');
         const headers: Record<string, string> = {};
-        if (tokenRec?.routingToken) {
-          headers['X-Routing-Token'] = tokenRec.routingToken;
+        if (secRec?.receiveSecret) {
+          headers['X-Receive-Secret'] = secRec.receiveSecret;
         }
         const apiUrl = getApiUrl();
         const res = await fetch(`${apiUrl}/api/lookup/${encodeURIComponent(claimedSender)}`, { headers });

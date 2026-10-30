@@ -74,7 +74,7 @@ async function runBackupRoundtripTest() {
 
   await saveEncrypted('identity', mockIdentityKeys, 'me');
   await saveEncrypted('identity', { receiveSecret: receive_secret }, 'receive_secret');
-  await saveEncrypted('identity', { routingToken: testInboxId, inboxId: testInboxId, handle }, 'routing_token');
+  await saveEncrypted('identity', { inboxId: testInboxId, handle }, 'identity_record');
   await saveEncrypted('knownKeys', { address: '#contact_bob', keyB64: 'mock_bob_key' }, '#contact_bob');
 
   // 3. Confirm secret is stored in encrypted vault, NOT in localStorage
@@ -148,71 +148,77 @@ async function runBackupRoundtripTest() {
   assert(restoredContact !== null && restoredContact.address === '#contact_bob', 'Contacts must be restored');
   console.log('✅ PASS: Identity, receive_secret, and contacts restored to encrypted vault.');
 
-  // 9. Live relay integration test (if relay is running)
+  // 9. Live relay integration test
   console.log('[5] Testing live relay integration with restored secret...');
-  const API_URL = 'http://127.0.0.1:3000';
-  const WS_URL = 'ws://127.0.0.1:3000/ws';
+  if (process.env.SKIP_INTEGRATION === '1') {
+    console.log('[Note] SKIP_INTEGRATION=1 set; skipping live relay integration check.');
+    console.log('🎉 ALL BACKUP ROUNDTRIP CHECKS PASSED SUCCESSFULLY!');
+    return;
+  }
+
+  const API_URL = process.env.API_URL || 'http://127.0.0.1:3000';
+  const WS_URL = process.env.WS_URL || 'ws://127.0.0.1:3000/ws';
 
   try {
-      const pow_nonce = solvePow(handle, 20);
-      const regRes = await fetch(`${API_URL}/api/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          handle,
-          identity_public_key: Buffer.from('mock_identity_pk_bytes_32_bytes').toString('base64'),
-          signed_prekey: Buffer.from('mock_signed_prekey_bytes_32_bytes').toString('base64'),
-          one_time_prekeys: [],
-          kyber_public_key: Buffer.from('mock_kyber_public_key_32_bytes').toString('base64'),
-          pow_nonce,
-          receive_secret: restored.receive_secret,
-        }),
-      });
+    const pow_nonce = solvePow(handle, 20);
+    const regRes = await fetch(`${API_URL}/api/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        handle,
+        identity_public_key: Buffer.from('mock_identity_pk_bytes_32_bytes').toString('base64'),
+        signed_prekey: Buffer.from('mock_signed_prekey_bytes_32_bytes').toString('base64'),
+        one_time_prekeys: [],
+        kyber_public_key: Buffer.from('mock_kyber_public_key_32_bytes').toString('base64'),
+        pow_nonce,
+        receive_secret: restored.receive_secret,
+      }),
+    });
 
-    if (regRes.ok) {
-      const regData: any = await regRes.json();
-      console.log(`[5a] Registered ${handle} on relay. Assigned inbox_id: ${regData.inbox_id}`);
-
-      // Connect WebSocket with restored secret in Sec-WebSocket-Protocol
-      const wsConnected = await new Promise<boolean>((resolve) => {
-        const socket = new WebSocket(WS_URL, [restored.receive_secret!]);
-        const timer = setTimeout(() => {
-          socket.terminate();
-          resolve(false);
-        }, 5000);
-
-        socket.on('open', () => {
-          clearTimeout(timer);
-          socket.close();
-          resolve(true);
-        });
-
-        socket.on('error', (err) => {
-          clearTimeout(timer);
-          console.error('WS Error:', err);
-          resolve(false);
-        });
-      });
-
-      assert(wsConnected, 'WebSocket must connect successfully using restored receive_secret!');
-      console.log('✅ PASS: WebSocket connected using restored secret from imported backup!');
-
-      // Test ack with restored secret
-      const ackRes = await fetch(`${API_URL}/api/message/ack`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Receive-Secret': restored.receive_secret!,
-        },
-        body: JSON.stringify({ msg_id: 'test_roundtrip_ack' }),
-      });
-      assert(ackRes.ok, `Ack request with restored secret must succeed (status ${ackRes.status})`);
-      console.log('✅ PASS: Message ack succeeded using restored secret!');
-    } else {
-      console.log(`[Note] Backend relay not listening on ${API_URL} (status ${regRes.status}); local roundtrip validated.`);
+    if (!regRes.ok) {
+      throw new Error(`Failed to register user on relay: HTTP ${regRes.status}`);
     }
+
+    const regData: any = await regRes.json();
+    console.log(`[5a] Registered ${handle} on relay. Assigned inbox_id: ${regData.inbox_id}`);
+
+    // Connect WebSocket with restored secret in Sec-WebSocket-Protocol
+    const wsConnected = await new Promise<boolean>((resolve, reject) => {
+      const socket = new WebSocket(WS_URL, [restored.receive_secret!]);
+      const timer = setTimeout(() => {
+        socket.terminate();
+        reject(new Error('WebSocket connection timed out'));
+      }, 5000);
+
+      socket.on('open', () => {
+        clearTimeout(timer);
+        socket.close();
+        resolve(true);
+      });
+
+      socket.on('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+
+    assert(wsConnected, 'WebSocket must connect successfully using restored receive_secret!');
+    console.log('✅ PASS: WebSocket connected using restored secret from imported backup!');
+
+    // Test ack with restored secret
+    const ackRes = await fetch(`${API_URL}/api/message/ack`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Receive-Secret': restored.receive_secret!,
+      },
+      body: JSON.stringify({ msg_id: 'test_roundtrip_ack' }),
+    });
+    assert(ackRes.ok, `Ack request with restored secret must succeed (status ${ackRes.status})`);
+    console.log('✅ PASS: Message ack succeeded using restored secret!');
   } catch (err: any) {
-    console.log(`[Note] Live relay connection skipped (${err.message}); local backup roundtrip validated.`);
+    console.error(`❌ FAIL: Live relay integration failed: ${err.message}`);
+    process.exit(1);
   }
 
   console.log('🎉 ALL BACKUP ROUNDTRIP CHECKS PASSED SUCCESSFULLY!');

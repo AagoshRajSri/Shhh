@@ -8,8 +8,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use aws_sdk_s3 as s3;
 use std::sync::Arc;
-use std::collections::HashMap;
-use tokio::sync::{broadcast, Mutex};
+use std::collections::{HashMap, HashSet};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{info, error};
 use sqlx::{PgPool, Row};
 use base64::{Engine as _, engine::general_purpose::STANDARD as b64};
@@ -59,8 +59,7 @@ struct LookupResponse {
 
 #[derive(Deserialize, Serialize, Clone)]
 struct SealedSenderEnvelope {
-    /// Public delivery address. Renamed from `to_routing_token` to prevent the old name
-    /// from being misread as a credential — the field carries only the public inbox_id UUID.
+    /// Public delivery address. Carries only the public inbox_id UUID.
     to_inbox_id: String,
     encrypted_payload: String,
 }
@@ -91,10 +90,21 @@ struct AppState {
     global_lookup_limiter: Arc<Mutex<(u32, chrono::DateTime<Utc>)>>,
     /// Per-IP rate limit on /api/register to slow Sybil identity minting.
     register_rate_limiter: RegisterRateLimiter,
-    /// Rate limiter for failed authentication attempts (10 failed attempts / 60s per IP).
+    /// Rate limiter for failed authentication attempts (10 failed attempts / 60s per IP, non-Tor only).
     failed_auth_limiter: FailedAuthLimiter,
-    /// Global failed authentication attempts backstop.
-    global_failed_auth_limiter: Arc<Mutex<(u32, chrono::DateTime<Utc>)>>,
+    /// In-memory cache of valid secret hashes.
+    /// Protects Postgres from junk credential exhaustion attacks: bogus secrets are rejected
+    /// in-memory in O(1) without touching Postgres. Eliminates the need for a global failure counter
+    /// that could be weaponized to lock out legitimate users.
+    ///
+    /// ARCHITECTURE / SINGLE-INSTANCE LIMITATION:
+    /// This set resides in process memory (alongside active_connections and rate limiters).
+    /// Running multiple backend instances would require shared state or synchronization.
+    ///
+    /// PHASE 8 LIFECYCLE NOTE:
+    /// When account deletion or secret rotation is added (Phase 8), the handler MUST
+    /// remove or atomically update the corresponding hash entry in this set.
+    valid_secret_hashes: Arc<RwLock<HashSet<[u8; 32]>>>,
     #[allow(dead_code)]
     tor_mode: bool,
 }
@@ -122,11 +132,12 @@ struct UploadCompleteRequest {
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
+    dotenvy::from_filename("../.env").ok();
     tracing_subscriber::fmt::init();
 
     let db_conn_string = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://securechat:CHANGEME@localhost:5432/securechat".to_string());
-    println!("Connecting to Postgres...");
+        .unwrap_or_else(|_| "postgres://securechat:password@localhost:5433/securechat".to_string());
+    println!("Connecting to Postgres at {}...", db_conn_string);
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(50)
         .connect(&db_conn_string)
@@ -141,7 +152,7 @@ async fn main() {
 
     println!("Connecting to Redis...");
     let redis_conn_string = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://:CHANGEME@localhost:6379".to_string());
+        .unwrap_or_else(|_| "redis://:password@localhost:6379".to_string());
     let redis_client = redis::Client::open(redis_conn_string).expect("Invalid Redis URL");
     let redis_conn = redis_client.get_multiplexed_async_connection().await.expect("Failed to connect to Redis");
 
@@ -151,7 +162,7 @@ async fn main() {
         .region(aws_config::Region::new("us-east-1"))
         .credentials_provider(s3::config::Credentials::new(
             std::env::var("S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string()),
-            std::env::var("S3_SECRET_KEY").unwrap_or_else(|_| "CHANGEME".to_string()),
+            std::env::var("S3_SECRET_KEY").unwrap_or_else(|_| "minioadminpassword".to_string()),
             None,
             None,
             "manual",
@@ -172,6 +183,28 @@ async fn main() {
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(false);
 
+    // STARTUP ORDERING GUARANTEE:
+    // The valid_secret_hashes set MUST finish loading from Postgres before the server binds
+    // or starts accepting connections. If incoming requests were served during warm-up, valid
+    // users would encounter false 401 Unauthorized errors from the in-memory fast-path check.
+    println!("Pre-loading registered secret hashes from Postgres into memory...");
+    let initial_hashes: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT receive_secret_hash FROM users WHERE auth_scheme = 'hash-v1'"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+
+    let mut hash_set = HashSet::new();
+    for h in initial_hashes {
+        if h.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&h);
+            hash_set.insert(arr);
+        }
+    }
+    println!("Startup warm-up complete: loaded {} valid secret hashes into memory.", hash_set.len());
+
     let state = Arc::new(AppState {
         pool,
         redis_conn,
@@ -183,7 +216,7 @@ async fn main() {
         global_lookup_limiter: Arc::new(Mutex::new((0, Utc::now()))),
         register_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
         failed_auth_limiter: Arc::new(Mutex::new(HashMap::new())),
-        global_failed_auth_limiter: Arc::new(Mutex::new((0, Utc::now()))),
+        valid_secret_hashes: Arc::new(RwLock::new(hash_set)),
         tor_mode,
     });
 
@@ -317,14 +350,14 @@ struct AuthenticatedUser {
 
 /// Authenticate a raw receive_secret string against the stored hash.
 ///
-/// # Tor-mode cost note
-/// In Tor mode the per-IP failed-auth limiter is intentionally disabled (shared onion-service
-/// IPs would lock out all users). However every authentication attempt — successful or not —
-/// still pays one SHA-256 hash and one DB lookup. The global_failed_auth_limiter (2 000/10 s)
-/// acts as the backstop against DB exhaustion. If handshake volume under Tor is a concern,
-/// a global concurrency semaphore (`tokio::sync::Semaphore`) on handshake auth would cap
-/// simultaneous in-flight DB lookups without touching per-IP state. Tor's own onion-service
-/// proof-of-work (tor ≥ 0.4.8) is the primary DoS defence.
+/// # Authentication and DoS Protection Model
+/// Authentication uses SHA-256("shhh-recv-v1" || secret) client-side secret tokens.
+/// To protect Postgres from query exhaustion under Tor or open network load, the server
+/// maintains an in-memory set of valid secret hashes (`valid_secret_hashes`).
+///
+/// Bogus credentials are rejected immediately in memory in O(1) time without touching Postgres.
+/// Because invalid secrets never touch Postgres and legitimate secrets always match the cache,
+/// valid users are never denied service by an adversary flooding invalid credentials.
 async fn authenticate_receive_secret(
     state: &Arc<AppState>,
     secret_str: &str,
@@ -332,10 +365,8 @@ async fn authenticate_receive_secret(
 ) -> Result<AuthenticatedUser, axum::http::StatusCode> {
     let now = Utc::now();
 
-    // 1. Per-IP failed-auth limit: max 10 per 60s.
+    // 1. Per-IP failed-auth limit: max 10 per 60s (non-Tor only).
     // SKIPPED in TOR_MODE: behind an onion service all users share a single IP.
-    // A 256-bit secret cannot be guessed online; this limit only protects DB load.
-    // Legitimate users must never be locked out by an attacker's 10 bad attempts.
     if !state.tor_mode {
         let rl = state.failed_auth_limiter.lock().await;
         if let Some((count, window_start)) = rl.get(&caller_ip) {
@@ -345,29 +376,16 @@ async fn authenticate_receive_secret(
         }
     }
 
-    // 2. Global failed auth limiter backstop: 2000 per 10s
-    {
-        let mut gl = state.global_failed_auth_limiter.lock().await;
-        if now.signed_duration_since(gl.1).num_seconds() > 10 {
-            gl.0 = 0;
-            gl.1 = now;
-        }
-        if gl.0 >= 2000 {
-            return Err(axum::http::StatusCode::TOO_MANY_REQUESTS);
-        }
-    }
-
     let record_failure = || async {
-        let mut rl = state.failed_auth_limiter.lock().await;
-        let entry = rl.entry(caller_ip).or_insert((0, now));
-        if now.signed_duration_since(entry.1).num_seconds() > 60 {
-            entry.0 = 0;
-            entry.1 = now;
+        if !state.tor_mode {
+            let mut rl = state.failed_auth_limiter.lock().await;
+            let entry = rl.entry(caller_ip).or_insert((0, now));
+            if now.signed_duration_since(entry.1).num_seconds() > 60 {
+                entry.0 = 0;
+                entry.1 = now;
+            }
+            entry.0 += 1;
         }
-        entry.0 += 1;
-
-        let mut gl = state.global_failed_auth_limiter.lock().await;
-        gl.0 += 1;
     };
 
     let computed_hash = match hash_receive_secret(secret_str) {
@@ -377,6 +395,16 @@ async fn authenticate_receive_secret(
             return Err(axum::http::StatusCode::UNAUTHORIZED);
         }
     };
+
+    // Fast-path in-memory hash check:
+    // Reject unknown/junk credentials immediately without querying Postgres.
+    {
+        let vsh = state.valid_secret_hashes.read().await;
+        if !vsh.contains(&computed_hash) {
+            record_failure().await;
+            return Err(axum::http::StatusCode::UNAUTHORIZED);
+        }
+    }
 
     let record = sqlx::query(
         "SELECT id, inbox_id, handle, receive_secret_hash, auth_scheme FROM users WHERE receive_secret_hash = $1"
@@ -504,6 +532,10 @@ async fn register_handler(
     match result {
         Ok(record) => {
             let assigned_inbox_id: uuid::Uuid = record.try_get("inbox_id").unwrap_or(inbox_id);
+            {
+                let mut vsh = state.valid_secret_hashes.write().await;
+                vsh.insert(secret_hash);
+            }
             info!("Registered handle: {} (assigned: {})", payload.handle, actual_handle);
             Ok(Json(RegisterResponse {
                 status: "success".to_string(),
@@ -535,11 +567,6 @@ async fn lookup_handler(
                 .get("Authorization")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "))
-        })
-        .or_else(|| {
-            headers
-                .get("X-Routing-Token")
-                .and_then(|v| v.to_str().ok())
         })
         .map(|s| s.trim().to_string());
 
@@ -1025,6 +1052,22 @@ mod tests {
             .load()
             .await;
 
+        let initial_hashes: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT receive_secret_hash FROM users WHERE auth_scheme = 'hash-v1'"
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+        let mut hash_set = HashSet::new();
+        for h in initial_hashes {
+            if h.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&h);
+                hash_set.insert(arr);
+            }
+        }
+
         Some(Arc::new(AppState {
             pool,
             redis_conn,
@@ -1036,7 +1079,7 @@ mod tests {
             global_lookup_limiter: Arc::new(Mutex::new((0, Utc::now()))),
             register_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             failed_auth_limiter: Arc::new(Mutex::new(HashMap::new())),
-            global_failed_auth_limiter: Arc::new(Mutex::new((0, Utc::now()))),
+            valid_secret_hashes: Arc::new(RwLock::new(hash_set)),
             tor_mode: false,
         }))
     }
@@ -1521,7 +1564,6 @@ mod tests {
         ).await;
         // We only need the upgrade to succeed; close immediately.
         if let Ok((mut ws, _)) = ws_result {
-            use futures_util::sink::SinkExt;
             let _ = ws.close(None).await;
         }
         // NOTE: a 401 here means the Postgres registration did not persist within the test;
@@ -1587,7 +1629,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tor_mode_valid_secret_succeeds_after_100_bad_attempts() {
+    async fn test_tor_mode_valid_secret_succeeds_after_2500_bad_attempts() {
         let base_state = match setup_test_state().await {
             Some(s) => s,
             None => return,
@@ -1605,7 +1647,7 @@ mod tests {
             global_lookup_limiter: Arc::new(Mutex::new((0, Utc::now()))),
             register_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             failed_auth_limiter: Arc::new(Mutex::new(HashMap::new())),
-            global_failed_auth_limiter: Arc::new(Mutex::new((0, Utc::now()))),
+            valid_secret_hashes: base_state.valid_secret_hashes.clone(),
             tor_mode: true,
         });
 
@@ -1624,22 +1666,23 @@ mod tests {
         let reg_resp = register_handler(dummy_connect_info(), State(tor_state.clone()), Json(reg_req)).await.unwrap().0;
         let alice_inbox_id = reg_resp.inbox_id;
 
-        // Attacker / bot spamming 100 bad auth attempts from the same Tor exit / loopback IP
+        // Attacker / bot spamming 2,500 bad auth attempts (exceeding the earlier 2,000 threshold).
+        // In-memory valid_secret_hashes cache rejects each attempt in O(1) without touching Postgres.
         let tor_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-        for i in 0..100 {
+        for i in 0..2500 {
             let bad_secret = format!("junk_secret_attempt_{}", i);
             let res = authenticate_receive_secret(&tor_state, &bad_secret, tor_ip).await;
             assert!(res.is_err(), "Bad secret attempt {} must fail", i);
             assert_eq!(res.unwrap_err(), axum::http::StatusCode::UNAUTHORIZED);
         }
 
-        // Attempt 101: Alice authenticates with her GENUINE receive_secret from the SAME IP
+        // Attempt 2,501: Alice authenticates with her GENUINE receive_secret from the SAME IP
         let legit_auth = authenticate_receive_secret(&tor_state, &alice_secret, tor_ip).await;
-        assert!(legit_auth.is_ok(), "Legitimate secret holder must connect even after 100 bad attempts on Tor!");
+        assert!(legit_auth.is_ok(), "Legitimate secret holder must connect even after 2,500 bad attempts on Tor!");
         assert_eq!(legit_auth.unwrap().inbox_id.to_string(), alice_inbox_id);
 
         // Seed a message in Alice's queue and verify legitimate ack succeeds
-        let msg_id = "test_msg_after_100_bad";
+        let msg_id = "test_msg_after_2500_bad";
         let queue_key = format!("msg_queue:{}", alice_inbox_id);
         let mut conn = tor_state.redis_conn.clone();
         let _: () = redis::cmd("HSET")
@@ -1656,7 +1699,7 @@ mod tests {
             auth_headers(&alice_secret),
             Json(AckRequest { msg_id: msg_id.to_string() }),
         ).await;
-        assert!(ack_res.is_ok(), "Legitimate ack must succeed after 100 bad attempts!");
+        assert!(ack_res.is_ok(), "Legitimate ack must succeed after mass bad attempts!");
 
         let exists: bool = redis::cmd("HEXISTS").arg(&queue_key).arg(msg_id).query_async(&mut conn).await.unwrap();
         assert!(!exists, "Message must be acknowledged and removed!");

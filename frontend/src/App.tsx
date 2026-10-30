@@ -43,7 +43,7 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [safetyNumber, setSafetyNumber] = useState<string | null>(null);
   const [keyChangeWarning, setKeyChangeWarning] = useState<{message: string, handle: string, pubkey: string} | null>(null);
-  const [myRoutingToken, setMyRoutingToken] = useState<string | null>(null);
+  const [myInboxId, setMyInboxId] = useState<string | null>(null);
   const [myReceiveSecret, setMyReceiveSecret] = useState<string | null>(null);
   const [powStatus, setPowStatus] = useState<string>('');
 
@@ -99,9 +99,8 @@ export default function App() {
   const lookupContact = async (targetHandle: string): Promise<{ inbox_id: string; identity_pubkey: string } | null> => {
     try {
       const cached = await loadEncrypted('knownKeys', targetHandle);
-      if (cached && (cached.inbox_id || cached.routing_token) && cached.identity_pubkey) {
-        const inboxId = cached.inbox_id || cached.routing_token;
-        return { inbox_id: inboxId, identity_pubkey: cached.identity_pubkey };
+      if (cached && cached.inbox_id && cached.identity_pubkey) {
+        return { inbox_id: cached.inbox_id, identity_pubkey: cached.identity_pubkey };
       }
 
       const headers: Record<string, string> = {};
@@ -114,7 +113,7 @@ export default function App() {
       const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(targetHandle)}`, { headers });
       if (!res.ok) return null;
       const data = await res.json();
-      const inboxId = data.inbox_id || data.routing_token;
+      const inboxId = data.inbox_id;
       if (data.status === 'success' && inboxId) {
         await saveEncrypted('knownKeys', {
           address: targetHandle,
@@ -139,11 +138,11 @@ export default function App() {
       return;
     }
     try {
-      const tokenRec = await loadEncrypted('identity', 'routing_token');
+      const identRec = await loadEncrypted('identity', 'identity_record');
       const secRec = await loadEncrypted('identity', 'receive_secret');
-      const token = myRoutingToken || tokenRec?.inboxId || tokenRec?.routingToken || '';
+      const inbox = myInboxId || identRec?.inboxId || '';
       const secret = myReceiveSecret || secRec?.receiveSecret || '';
-      const backupJson = await exportIdentity(handle, token, pw, secret);
+      const backupJson = await exportIdentity(handle, inbox, pw, secret);
       const blob = new Blob([backupJson], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -167,7 +166,7 @@ export default function App() {
       const restored = await importIdentity(text, pw);
       setHandle(restored.handle);
       const inboxId = restored.inbox_id;
-      setMyRoutingToken(inboxId);
+      setMyInboxId(inboxId);
       if (restored.receive_secret) {
         setMyReceiveSecret(restored.receive_secret);
         wsService.connect(restored.receive_secret);
@@ -205,8 +204,6 @@ export default function App() {
       identityBundle = await signalService.generatePreKeyBundle();
     }
     
-    let routingToken: string | null = null;
-
     try {
       if (!hasIdentity) {
         setPowStatus('Computing cryptographic proof-of-work (difficulty 20)...');
@@ -239,8 +236,7 @@ export default function App() {
         }
 
         const data = await response.json();
-        const inboxId = data.inbox_id || data.routing_token;
-        routingToken = inboxId;
+        const assignedInboxId = data.inbox_id;
         const assigned = data.assigned_handle || cleanHandle;
         if (assigned !== cleanHandle) {
           alert(`Notice: Handle was already in use. You have been assigned: ${assigned}`);
@@ -248,24 +244,23 @@ export default function App() {
           setHandle(assigned);
         }
 
-        await saveEncrypted('identity', { routingToken: inboxId, inboxId, handle: cleanHandle }, 'routing_token');
+        await saveEncrypted('identity', { inboxId: assignedInboxId, handle: cleanHandle }, 'identity_record');
         await saveEncrypted('identity', { receiveSecret: receive_secret }, 'receive_secret');
-        setMyRoutingToken(inboxId);
+        setMyInboxId(assignedInboxId);
         setMyReceiveSecret(receive_secret);
         wsService.connect(receive_secret);
         setIsLoggedIn(true);
       } else {
         const secRec = await loadEncrypted('identity', 'receive_secret');
-        const tokenRec = await loadEncrypted('identity', 'routing_token');
+        const identRec = await loadEncrypted('identity', 'identity_record');
         const curSecret = secRec?.receiveSecret;
-        const inboxId = tokenRec?.inboxId || tokenRec?.routingToken;
+        const curInboxId = identRec?.inboxId;
 
-        if (tokenRec && inboxId) {
-          routingToken = inboxId;
-          setMyRoutingToken(inboxId);
-          if (tokenRec.handle) {
-            cleanHandle = tokenRec.handle;
-            setHandle(tokenRec.handle);
+        if (identRec && curInboxId) {
+          setMyInboxId(curInboxId);
+          if (identRec.handle) {
+            cleanHandle = identRec.handle;
+            setHandle(identRec.handle);
           }
         }
         if (curSecret) {
@@ -274,15 +269,9 @@ export default function App() {
           setIsLoggedIn(true);
         }
       }
-
-      if (routingToken) {
-        wsService.connect(routingToken);
-        setIsLoggedIn(true);
-      }
     } catch (err: any) {
-      console.warn("Backend error, falling back to mock routing token for dev", err);
-      wsService.connect('my-mock-routing-token');
-      setIsLoggedIn(true);
+      console.error("Login / registration error", err);
+      alert("Failed to initialize session: " + (err.message || err));
     } finally {
       setIsInitializing(false);
       setPowStatus('');
