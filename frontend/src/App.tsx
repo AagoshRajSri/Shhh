@@ -90,17 +90,18 @@ export default function App() {
       } catch (e: any) {
         setCryptoSupported(
           `Required cryptographic algorithm not supported: ${e?.message ?? e}. ` +
-          'Please use Tor Browser 13.5 or later (Firefox ESR 115+).'
+          'Please use current Tor Browser 15.x (or modern browser with WebCrypto support).'
         );
       }
     })();
   }, []);
 
-  const lookupContact = async (targetHandle: string): Promise<{ routing_token: string; identity_pubkey: string } | null> => {
+  const lookupContact = async (targetHandle: string): Promise<{ inbox_id: string; identity_pubkey: string } | null> => {
     try {
       const cached = await loadEncrypted('knownKeys', targetHandle);
-      if (cached && cached.routing_token && cached.identity_pubkey) {
-        return { routing_token: cached.routing_token, identity_pubkey: cached.identity_pubkey };
+      if (cached && (cached.inbox_id || cached.routing_token) && cached.identity_pubkey) {
+        const inboxId = cached.inbox_id || cached.routing_token;
+        return { inbox_id: inboxId, identity_pubkey: cached.identity_pubkey };
       }
 
       const headers: Record<string, string> = {};
@@ -113,15 +114,16 @@ export default function App() {
       const res = await fetch(`${API_URL}/api/lookup/${encodeURIComponent(targetHandle)}`, { headers });
       if (!res.ok) return null;
       const data = await res.json();
-      if (data.status === 'success' && data.routing_token) {
+      const inboxId = data.inbox_id || data.routing_token;
+      if (data.status === 'success' && inboxId) {
         await saveEncrypted('knownKeys', {
           address: targetHandle,
           handle: targetHandle,
-          routing_token: data.routing_token,
+          inbox_id: inboxId,
           identity_pubkey: data.identity_pubkey,
           keyB64: data.identity_pubkey,
         }, targetHandle);
-        return data;
+        return { inbox_id: inboxId, identity_pubkey: data.identity_pubkey };
       }
       return null;
     } catch (e) {
@@ -164,7 +166,7 @@ export default function App() {
       const text = await file.text();
       const restored = await importIdentity(text, pw);
       setHandle(restored.handle);
-      const inboxId = restored.inbox_id || restored.routing_token;
+      const inboxId = restored.inbox_id;
       setMyRoutingToken(inboxId);
       if (restored.receive_secret) {
         setMyReceiveSecret(restored.receive_secret);
@@ -353,16 +355,16 @@ export default function App() {
       return;
     }
 
-    // 3. Exists in Database & Get Routing Token (checks local knownKeys cache first)
+    // 3. Exists in Database & Get inbox_id (checks local knownKeys cache first)
     try {
       const data = await lookupContact(targetHandle);
       
-      if (!data || !data.routing_token) {
+      if (!data || !data.inbox_id) {
         setErrorMsg(`User ${targetHandle} could not be resolved or does not exist.`);
         return;
       }
       
-      const to_routing_token = data.routing_token;
+      const to_inbox_id = data.inbox_id;
 
       if (await signalService.checkKeyChange(targetHandle, data.identity_pubkey)) {
         setKeyChangeWarning({
@@ -392,9 +394,9 @@ export default function App() {
         addMessage(`Contact request sent to ${targetHandle}: "${messageText}"`, 'me', 'system');
       }
 
-      console.log(`Routing sealed envelope to ${to_routing_token}`);
+      console.log(`Routing sealed envelope to ${to_inbox_id}`);
       wsService.send({
-        to_routing_token,
+        to_inbox_id,
         encrypted_payload
       });
       
@@ -413,14 +415,14 @@ export default function App() {
       if (msgType === 'message') addMessage(messageText, 'me');
       else addMessage(`Contact request sent to ${targetHandle}: "${messageText}"`, 'me', 'system');
 
-      wsService.send({ to_routing_token: 'my-mock-routing-token', encrypted_payload });
+      wsService.send({ to_inbox_id: 'my-mock-inbox-id', encrypted_payload });
       setActiveChat(targetHandle);
       
       // Simulate recipient echoing back the contact request in offline mode
       setTimeout(async () => {
         const replyPayload = { from: targetHandle, type: msgType, text: messageText };
         const mockReplyCipher = await signalService.encryptMessage(handle, 'fake_pubkey', replyPayload);
-        wsService.send({ to_routing_token: 'my-mock-routing-token', encrypted_payload: mockReplyCipher });
+        wsService.send({ to_inbox_id: 'my-mock-inbox-id', encrypted_payload: mockReplyCipher });
       }, 500);
     }
   };
@@ -481,13 +483,13 @@ export default function App() {
       };
       
       const data = await lookupContact(activeChat);
-      if (data && data.routing_token) {
+      if (data && data.inbox_id) {
         if (await signalService.checkKeyChange(activeChat, data.identity_pubkey)) {
           alert(`WARNING: The security keys for ${activeChat} have changed! This could mean they re-registered, or it could be a man-in-the-middle attack. Verify safety numbers!`);
         }
         const encrypted_payload = await signalService.encryptMessage(activeChat, data.identity_pubkey, payload);
         wsService.send({
-          to_routing_token: data.routing_token,
+          to_inbox_id: data.inbox_id,
           encrypted_payload
         });
       }
@@ -520,7 +522,7 @@ export default function App() {
     // Notify sender that their request was accepted
     try {
       const data = await lookupContact(from);
-      if (data && data.routing_token) {
+      if (data && data.inbox_id) {
         const payload = {
           from: handle,
           type: 'message',
@@ -528,7 +530,7 @@ export default function App() {
         };
         const encrypted_payload = await signalService.encryptMessage(from, data.identity_pubkey, payload);
         wsService.send({
-          to_routing_token: data.routing_token,
+          to_inbox_id: data.inbox_id,
           encrypted_payload
         });
       }
@@ -617,7 +619,7 @@ export default function App() {
             {cryptoSupported}
           </p>
           <p className="text-xs text-zinc-500 leading-relaxed">
-            Shhh requires <strong className="text-zinc-300">Tor Browser 13.5+</strong> (Firefox ESR 115+) or any
+            Shhh requires <strong className="text-zinc-300">current Tor Browser 15.x</strong> or any
             modern browser in a secure context (HTTPS / .onion). The X25519 key
             exchange and ECDSA P-256 signing algorithms must be available in{' '}
             <code className="text-zinc-400">crypto.subtle</code>.

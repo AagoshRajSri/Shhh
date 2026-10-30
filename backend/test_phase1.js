@@ -37,14 +37,14 @@ async function testPhase1() {
   
   console.log("Real Data Shape:", {
       statusType: typeof realData.status,
-      tokenType: typeof realData.routing_token,
-      tokenLength: realData.routing_token.length,
+      inboxIdType: typeof realData.inbox_id,
+      inboxIdLength: (realData.inbox_id || '').length,
       pubkeyType: typeof realData.identity_pubkey
   });
   console.log("Fake Data Shape:", {
       statusType: typeof fakeData.status,
-      tokenType: typeof fakeData.routing_token,
-      tokenLength: fakeData.routing_token.length,
+      inboxIdType: typeof fakeData.inbox_id,
+      inboxIdLength: (fakeData.inbox_id || '').length,
       pubkeyType: typeof fakeData.identity_pubkey
   });
 

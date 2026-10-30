@@ -9,5 +9,10 @@ ALTER TABLE users
     ADD COLUMN IF NOT EXISTS receive_secret_hash BYTEA NOT NULL,
     ADD COLUMN IF NOT EXISTS auth_scheme VARCHAR(32) NOT NULL DEFAULT 'hash-v1';
 
+-- Ensure legacy routing_token column is completely removed if previously added.
+-- (The original table definition only had `id`, which was aliased as routing_token in DTOs).
+ALTER TABLE users DROP COLUMN IF EXISTS routing_token;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_inbox_id ON users(inbox_id);
 CREATE INDEX IF NOT EXISTS idx_users_secret_hash ON users(receive_secret_hash);
+

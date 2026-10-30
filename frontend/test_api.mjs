@@ -45,8 +45,8 @@ async function run() {
             body: JSON.stringify(body)
         });
         const data = await res.json();
-        routingToken = data.routing_token;
-        return { pass: data.status === 'success' && !!routingToken, detail: `token=${routingToken}` };
+        routingToken = data.inbox_id;
+        return { pass: data.status === 'success' && !!routingToken, detail: `inbox_id=${routingToken}` };
     });
 
     // 3. Duplicate
@@ -63,7 +63,7 @@ async function run() {
     await test('GET /api/lookup (exists)', async () => {
         const res = await fetch(`${baseUrl}/api/lookup/${encodeURIComponent(handle)}`);
         const data = await res.json();
-        return { pass: data.routing_token === routingToken, detail: `token_match=${data.routing_token === routingToken}` };
+        return { pass: data.inbox_id === routingToken, detail: `inbox_id_match=${data.inbox_id === routingToken}` };
     });
 
     // 5. Ghost
@@ -95,7 +95,7 @@ async function run() {
         const res = await fetch(`${baseUrl}/api/message`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ to_routing_token: routingToken, encrypted_payload: 'test' })
+            body: JSON.stringify({ to_inbox_id: routingToken, encrypted_payload: 'test' })
         });
         const data = await res.json();
         return { pass: data.status === 'queued', detail: data.status };

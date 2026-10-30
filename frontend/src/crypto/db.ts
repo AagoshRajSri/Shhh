@@ -54,9 +54,54 @@ export function initDB() {
   });
 }
 
-// The master key wraps all per-store ciphertexts in IndexedDB.
-// Stored unprotected in localStorage — protects from casual access on shared devices only.
-// Export passphrase protection uses Argon2id independently.
+/**
+ * Wipe IndexedDB and reset local master key state (e.g. on logout, session reset, or test wipe).
+ */
+export async function wipeDatabase(): Promise<void> {
+  if (dbPromise) {
+    try {
+      const db = await dbPromise;
+      db.close();
+    } catch { /* ignore if already closed */ }
+  }
+  if (typeof indexedDB !== 'undefined' && indexedDB.deleteDatabase) {
+    await indexedDB.deleteDatabase('securechat-db');
+  }
+  masterKey = null;
+  initDB();
+}
+
+
+// ---------------------------------------------------------------------------
+// Local device key (shhh_local_device_key in localStorage)
+//
+// SECURITY MODEL:
+//   getMasterKey() generates a 256-bit AES-GCM key on first load and stores the
+//   raw bytes (base64) in localStorage under "shhh_local_device_key". This key
+//   wraps all per-store ciphertexts in IndexedDB.
+//
+//   Because the key material lives in localStorage alongside the ciphertexts, any
+//   attacker who can READ the site's storage (XSS, DevTools, browser-storage
+//   extraction) can decrypt IndexedDB records directly.
+//
+//   What this protects against:
+//   - Casual shoulder-surfing inspection via DevTools.
+//   - Browser profiles copied without the localStorage origin partition.
+//
+//   What this does NOT protect against:
+//   - An attacker with filesystem or storage API read access to the browser profile.
+//   - XSS (same origin can read both localStorage and IndexedDB).
+//
+//   Stronger alternatives (not yet implemented):
+//   - Non-extractable CryptoKey stored only in IndexedDB (inaccessible to JS after
+//     import, survives session close but NOT Tor Browser wipe).
+//   - Key derived from a user-typed passphrase (protects at rest; Argon2id export
+//     already does this for the backup bundle).
+//
+//   The Argon2id export/import path (exportIdentity / importIdentity) provides
+//   passphrase-protected key material for cross-session or cross-device recovery
+//   and is unaffected by this limitation.
+// ---------------------------------------------------------------------------
 let masterKey: CryptoKey | null = null;
 
 export async function getMasterKey(): Promise<CryptoKey> {
@@ -105,8 +150,9 @@ export async function saveEncrypted(storeName: 'identity' | 'sessions' | 'prekey
   );
 
   const db = await dbPromise;
+  const keyProp = (storeName === 'sessions' || storeName === 'knownKeys') ? 'address' : 'id';
   await db.put(storeName, {
-    [storeName === 'identity' ? 'id' : storeName === 'sessions' ? 'address' : 'id']: idKey,
+    [keyProp]: idKey,
     encryptedData: storeName === 'identity' ? encrypted : undefined,
     encryptedRecord: storeName !== 'identity' ? encrypted : undefined,
     iv
@@ -129,7 +175,7 @@ export async function loadEncrypted(storeName: 'identity' | 'sessions' | 'prekey
       encryptedBuffer
     );
     return JSON.parse(new TextDecoder().decode(decrypted));
-  } catch (e) {
+  } catch (_e) {
     console.warn(`Local record in ${storeName} could not be decrypted. Resetting obsolete record.`);
     try {
       await db.delete(storeName, idKey as any);
@@ -147,7 +193,7 @@ export async function loadEncrypted(storeName: 'identity' | 'sessions' | 'prekey
 //   { v: 1, salt: "<hex>", iv: "<hex>", ct: "<hex>" }
 //
 // Plaintext (before encryption):
-//   { handle, routing_token, identity, seenNonces, knownKeys[] }
+//   { handle, inbox_id, receive_secret, identity, seenNonces, knownKeys[] }
 //
 // Argon2id tuning (target ~1 s on a 500 MHz / low-end device):
 //   iterations=3, memory=65536 KiB (64 MiB), parallelism=1, hashLength=32
@@ -178,7 +224,7 @@ async function deriveKeyFromPassphrase(passphrase: string, saltHex: string): Pro
 
 /**
  * Export identity bundle to an Argon2id-encrypted JSON string.
- * Bundles: handle, routing_token, identity keys (JWK), seen nonces, knownKeys store.
+ * Bundles: handle, inbox_id, identity keys (JWK), seen nonces, knownKeys store.
  *
  * FOR TOR USERS: Tor Browser wipes IndexedDB on window close. This export is
  * mandatory to keep your identity across sessions. Store the passphrase and
@@ -200,24 +246,21 @@ export async function exportIdentity(
   const db = await dbPromise;
   const knownKeysOut: Array<{ address: string; keyB64: string }> = [];
   const masterK = await getMasterKey();
-  let cursor = await db.transaction('knownKeys').store.openCursor();
-  while (cursor) {
+  const allRecords = await db.getAll('knownKeys');
+  for (const rec of allRecords) {
     try {
-      const rec = cursor.value as any;
       const decrypted = await window.crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: rec.iv },
+        { name: 'AES-GCM', iv: rec.iv as any },
         masterK,
         rec.encryptedRecord,
       );
       knownKeysOut.push(JSON.parse(new TextDecoder().decode(decrypted)));
     } catch { /* skip corrupt record */ }
-    cursor = await cursor.continue();
   }
 
   const plaintext = JSON.stringify({
     handle,
     inbox_id: routingToken,
-    routing_token: routingToken,
     receive_secret: secret,
     identity,
     seenNonces,
@@ -234,9 +277,9 @@ export async function exportIdentity(
 /**
  * Import an Argon2id-encrypted identity backup.
  * Restores identity keys, receive_secret, nonce set, and knownKeys into IndexedDB.
- * Returns { handle, routing_token, inbox_id, receive_secret } on success.
+ * Returns { handle, inbox_id, receive_secret } on success.
  */
-export async function importIdentity(fileContent: string, passphrase: string): Promise<{ handle: string; routing_token: string; inbox_id: string; receive_secret?: string }> {
+export async function importIdentity(fileContent: string, passphrase: string): Promise<{ handle: string; inbox_id: string; receive_secret?: string }> {
   if (!dbPromise) initDB();
 
   const exportObj = JSON.parse(fileContent);
@@ -274,6 +317,6 @@ export async function importIdentity(fileContent: string, passphrase: string): P
     }
   }
 
-  return { handle: data.handle, routing_token: inboxId, inbox_id: inboxId, receive_secret: data.receive_secret };
+  return { handle: data.handle, inbox_id: inboxId, receive_secret: data.receive_secret };
 }
 

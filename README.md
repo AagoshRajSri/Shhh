@@ -9,7 +9,7 @@
 - **Zero-Knowledge Identity:** Sender authentication via independently verified ECDSA P-256 signatures. Provides a mechanism to detect server-side impersonation, when used.
 - **Robust Replay Protection:** Per-message UUID nonce deduplication with a strict 7-day TTL window (synchronized securely across browser tabs via Web Locks API).
 - **Proof-of-Work Registration:** Client-side PoW difficulty challenge to mitigate automated handle registration and Sybil attacks.
-- **Identity Vault:** Password-protected identity key and secret backup/export using Argon2id key derivation.
+- **Identity Vault:** Password-protected identity key and `receive_secret` backup/export using Argon2id key derivation (AES-GCM, 64 MiB memory cost). The **runtime** vault (IndexedDB) is wrapped by a per-device AES-GCM key stored in `localStorage` (`shhh_local_device_key`). This protects keys from casual DevTools inspection; it does **not** protect against an attacker who can read browser storage (XSS or filesystem extraction). See `db.ts` for the full security model and planned improvements.
 - **Encrypted Media:** Client-side convergent encryption (ChaCha20-Poly1305) for attachments, chunked securely to a self-hosted S3-compatible backend (MinIO).
 - **Ephemeral Rate Limiting:** IP-based, token-based, and handle-based limiters to prevent global and targeted enumeration attacks.
 
@@ -34,7 +34,7 @@ Shhh requires `crypto.subtle` with **X25519** (ECDH) and **ECDSA P-256** (signin
 
 | Client | Minimum version | Notes |
 |---|---|---|
-| **Tor Browser** | **13.5** (Firefox ESR 115+) | Required for X25519 in `crypto.subtle` |
+| **Tor Browser** | **Current 15.x** (Firefox ESR 140+) | Recommended client for .onion access; requires `crypto.subtle` support |
 | Chrome / Edge | 130+ | Full support |
 | Firefox | 133+ | Full support |
 | Safari | 17+ | Full support |
@@ -93,6 +93,8 @@ Inside an active chat, click on the remote user's handle to reveal the **Safety 
 - **Recipient-Routed Transport:** The relay is recipient-routed via public `inbox_id`. While message envelopes are end-to-end encrypted (E2EE) and cannot be decrypted by the server, the relay can observe which WebSocket connection sends to which recipient `inbox_id`. Sealed sender (anonymous routing) is not implemented.
 - **Single-Instance Relay:** Active connections and rate limiters reside in server memory, requiring deployment as a single instance.
 - **Forward Secrecy:** Key rotation is performed at rotation granularity; per-message forward secrecy (Double Ratchet) is planned in the cryptographic roadmap.
+- **Runtime Vault Key in localStorage:** The AES-GCM master key (`shhh_local_device_key`) that wraps IndexedDB records lives in `localStorage` on the same origin. This protects against casual inspection only — any script or tool with read access to browser storage can recover both the key and the ciphertext. A passphrase-derived or non-extractable `CryptoKey` solution is on the roadmap.
+- **Tor Mode Handshake Cost:** When `TOR_MODE=true` the per-IP failed-auth limiter is disabled (shared onion-service IPs would otherwise lock out all users). Each failed WebSocket handshake still costs one SHA-256 and one DB lookup, bounded only by the global limiter (2 000/10 s). Tor's onion-service proof-of-work (tor ≥ 0.4.8) is the primary DoS defence; a global concurrency semaphore on handshake auth is on the roadmap.
 
 ## Legal & Transparency
 Shhh is designed around the principles of privacy and minimal data collection. Because the application utilizes End-to-End Encryption (E2EE), the server does not possess the cryptographic keys required to decrypt message contents or media. 

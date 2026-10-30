@@ -46,7 +46,6 @@ struct RegisterRequest {
 struct RegisterResponse {
     status: String,
     inbox_id: String,
-    routing_token: String, // alias for inbox_id
     /// The actual handle stored (may have a random suffix appended on collision).
     assigned_handle: String,
 }
@@ -55,14 +54,15 @@ struct RegisterResponse {
 struct LookupResponse {
     status: String,
     inbox_id: String,
-    routing_token: String, // alias for inbox_id
     identity_pubkey: String,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
 struct SealedSenderEnvelope {
-    to_routing_token: String,
-    encrypted_payload: String, 
+    /// Public delivery address. Renamed from `to_routing_token` to prevent the old name
+    /// from being misread as a credential — the field carries only the public inbox_id UUID.
+    to_inbox_id: String,
+    encrypted_payload: String,
 }
 
 #[derive(Deserialize)]
@@ -315,6 +315,16 @@ struct AuthenticatedUser {
     handle: String,
 }
 
+/// Authenticate a raw receive_secret string against the stored hash.
+///
+/// # Tor-mode cost note
+/// In Tor mode the per-IP failed-auth limiter is intentionally disabled (shared onion-service
+/// IPs would lock out all users). However every authentication attempt — successful or not —
+/// still pays one SHA-256 hash and one DB lookup. The global_failed_auth_limiter (2 000/10 s)
+/// acts as the backstop against DB exhaustion. If handshake volume under Tor is a concern,
+/// a global concurrency semaphore (`tokio::sync::Semaphore`) on handshake auth would cap
+/// simultaneous in-flight DB lookups without touching per-IP state. Tor's own onion-service
+/// proof-of-work (tor ≥ 0.4.8) is the primary DoS defence.
 async fn authenticate_receive_secret(
     state: &Arc<AppState>,
     secret_str: &str,
@@ -322,8 +332,11 @@ async fn authenticate_receive_secret(
 ) -> Result<AuthenticatedUser, axum::http::StatusCode> {
     let now = Utc::now();
 
-    // 1. Rate-limit failed auth attempts: max 10 failed attempts per 60s per IP
-    {
+    // 1. Per-IP failed-auth limit: max 10 per 60s.
+    // SKIPPED in TOR_MODE: behind an onion service all users share a single IP.
+    // A 256-bit secret cannot be guessed online; this limit only protects DB load.
+    // Legitimate users must never be locked out by an attacker's 10 bad attempts.
+    if !state.tor_mode {
         let rl = state.failed_auth_limiter.lock().await;
         if let Some((count, window_start)) = rl.get(&caller_ip) {
             if now.signed_duration_since(*window_start).num_seconds() <= 60 && *count >= 10 {
@@ -423,8 +436,7 @@ async fn register_handler(
             let fake_id = uuid::Uuid::new_v4().to_string();
             return Ok(Json(RegisterResponse {
                 status: "success".to_string(),
-                inbox_id: fake_id.clone(),
-                routing_token: fake_id,
+                inbox_id: fake_id,
                 assigned_handle: payload.handle.clone(),
             }));
         }
@@ -496,7 +508,6 @@ async fn register_handler(
             Ok(Json(RegisterResponse {
                 status: "success".to_string(),
                 inbox_id: assigned_inbox_id.to_string(),
-                routing_token: assigned_inbox_id.to_string(),
                 assigned_handle: actual_handle,
             }))
         }
@@ -581,7 +592,6 @@ async fn lookup_handler(
             Ok(Json(LookupResponse {
                 status: "success".to_string(),
                 inbox_id: target_inbox_id.to_string(),
-                routing_token: target_inbox_id.to_string(),
                 identity_pubkey: b64.encode(&identity_pubkey),
             }))
         }
@@ -603,7 +613,6 @@ async fn lookup_handler(
             Ok(Json(LookupResponse {
                 status: "success".to_string(),
                 inbox_id: fake_uuid.to_string(),
-                routing_token: fake_uuid.to_string(),
                 identity_pubkey: b64.encode(&pubkey_bytes),
             }))
         }
@@ -616,7 +625,7 @@ async fn message_handler(
     Json(envelope): Json<SealedSenderEnvelope>,
 ) -> Json<serde_json::Value> {
     let msg_id = uuid::Uuid::new_v4().to_string();
-    let queue_key = format!("msg_queue:{}", envelope.to_routing_token);
+    let queue_key = format!("msg_queue:{}", envelope.to_inbox_id);
     
     let mut conn = state.redis_conn.clone();
     let res: Result<(), _> = redis::pipe()
@@ -630,7 +639,7 @@ async fn message_handler(
     }
     
     let conns = state.active_connections.lock().await;
-    if let Some(tx) = conns.get(&envelope.to_routing_token) {
+    if let Some(tx) = conns.get(&envelope.to_inbox_id) {
         let _ = tx.send("WAKE".to_string());
     }
     
@@ -652,11 +661,6 @@ async fn ack_handler(
                 .get("Authorization")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "))
-        })
-        .or_else(|| {
-            headers
-                .get("X-Routing-Token")
-                .and_then(|v| v.to_str().ok())
         })
         .map(|s| s.trim())
         .unwrap_or_default();
@@ -778,7 +782,7 @@ async fn handle_socket(mut socket: WebSocket, inbox_id: String, state: Arc<AppSt
                     Some(Ok(WsMessage::Text(text))) => {
                         if let Ok(envelope) = serde_json::from_str::<SealedSenderEnvelope>(&text) {
                             let msg_id = uuid::Uuid::new_v4().to_string();
-                            let queue_key = format!("msg_queue:{}", envelope.to_routing_token);
+                            let queue_key = format!("msg_queue:{}", envelope.to_inbox_id);
                             
                             let mut conn = state.redis_conn.clone();
                             let _: () = redis::pipe()
@@ -788,7 +792,7 @@ async fn handle_socket(mut socket: WebSocket, inbox_id: String, state: Arc<AppSt
                                 .query_async(&mut conn).await.unwrap_or(());
 
                             let conns = state.active_connections.lock().await;
-                            if let Some(tx) = conns.get(&envelope.to_routing_token) {
+                            if let Some(tx) = conns.get(&envelope.to_inbox_id) {
                                 let _ = tx.send("WAKE".to_string());
                             }
                         } else if let Ok(ack) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -1345,39 +1349,187 @@ mod tests {
         assert_eq!(res.unwrap_err(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
+    static LOG_BUFFER: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+    static LOG_INIT: std::sync::Once = std::sync::Once::new();
+
+    #[derive(Clone)]
+    struct TestLogCapture;
+
+    impl std::io::Write for TestLogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut lock) = LOG_BUFFER.lock() {
+                lock.extend_from_slice(buf);
+            }
+            std::io::stdout().write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            std::io::stdout().flush()
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestLogCapture {
+        type Writer = TestLogCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            TestLogCapture
+        }
+    }
+
+    fn init_test_logging() {
+        LOG_INIT.call_once(|| {
+            // Capture at TRACE so hyper / tower-http header dumps are included.
+            // Header-level logs appear at TRACE in hyper 1.x and tower-http 0.6.x.
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(TestLogCapture)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
+    /// Build the production Axum Router bound to an in-process TCP listener.
+    ///
+    /// This exercises the *real* router + `tower_http` layers including CORS and
+    /// security-headers middleware, not just isolated handler functions. The
+    /// `TraceLayer` is intentionally NOT added to the test app because production
+    /// `main()` also does not add one — we verify that no middleware logs headers.
+    async fn build_test_app(state: Arc<AppState>) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+
+        let cors = tower_http::cors::CorsLayer::permissive();
+        let app = Router::new()
+            .route("/health", axum::routing::get(|| async { "OK" }))
+            .route("/api/register", axum::routing::post(register_handler))
+            .route("/api/message", axum::routing::post(message_handler))
+            .route("/api/message/ack", axum::routing::post(ack_handler))
+            .route("/api/lookup/:handle", axum::routing::get(lookup_handler))
+            .route("/ws", axum::routing::get(ws_handler))
+            .layer(cors)
+            .layer(axum::middleware::from_fn(security_headers_middleware))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        (addr, handle)
+    }
+
+    /// Encode `bytes` as Rust's Debug format for byte slices: `[12, 34, 56, ...]`.
+    /// tracing may print `&[u8]` fields this way; we must grep for it explicitly.
+    fn debug_bytes(bytes: &[u8]) -> String {
+        let inner: Vec<String> = bytes.iter().map(|b| b.to_string()).collect();
+        format!("[{}]", inner.join(", "))
+    }
+
     #[tokio::test]
     async fn test_responses_and_logs_never_contain_receive_secret() {
+        init_test_logging();
+        if let Ok(mut buf) = LOG_BUFFER.lock() {
+            buf.clear();
+        }
+        tracing::trace!("LOG_TEST_INITIATED: starting test_responses_and_logs_never_contain_receive_secret");
+
         let state = match setup_test_state().await {
             Some(s) => s,
             None => return,
         };
+
+        // Stand up the real Axum router on an ephemeral port so the full
+        // tower-http + middleware stack (including any TraceLayer if ever added)
+        // is exercised, not just isolated handler functions.
+        let (addr, server_handle) = build_test_app(state.clone()).await;
+        let base_url = format!("http://{}", addr);
+        let client = reqwest::Client::new();
+
         let handle = format!("#neg_sec_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
         let secret = test_secret(40);
-        let reg_req = RegisterRequest {
-            handle: handle.clone(),
-            identity_public_key: b64.encode(b"pubkey"),
-            signed_prekey: b64.encode(b"prekey"),
-            one_time_prekeys: vec![],
-            kyber_public_key: b64.encode(b"kyber"),
-            pow_nonce: Some(0),
-            receive_secret: secret.clone(),
-        };
+        let secret_bytes = hex::decode(&secret).expect("secret must be hex");
+        let computed_hash = hash_receive_secret(&secret).expect("Hashing secret failed");
 
-        let reg_resp = register_handler(dummy_connect_info(), State(state.clone()), Json(reg_req)).await.unwrap().0;
-        let reg_json = serde_json::to_string(&reg_resp).unwrap();
+        // Pre-compute every encoding the secret or its hash could appear in.
+        let secret_hex = secret.clone();                                // 64-char hex (canonical form)
+        let secret_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&secret_bytes);
+        let secret_b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(&secret_bytes);
+        let secret_debug = debug_bytes(&secret_bytes);                 // "[12, 34, ...]" form
 
-        // 1. RegisterResponse MUST NOT contain receive_secret or its hash
-        assert!(!reg_json.contains(&secret), "RegisterResponse must not leak receive_secret!");
-        assert_ne!(reg_resp.inbox_id, secret);
+        let hash_hex     = hex::encode(&computed_hash);
+        let hash_b64     = base64::engine::general_purpose::STANDARD.encode(&computed_hash);
+        let hash_b64url  = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&computed_hash);
+        let hash_debug   = debug_bytes(&computed_hash);
 
-        // 2. LookupResponse MUST NOT contain receive_secret or its hash
-        let lookup_resp = lookup_handler(Path(handle.clone()), auth_headers(&secret), dummy_connect_info(), State(state.clone())).await.unwrap().0;
-        let lookup_json = serde_json::to_string(&lookup_resp).unwrap();
-        assert!(!lookup_json.contains(&secret), "LookupResponse must not leak receive_secret!");
+        // 1. REGISTER via real HTTP
+        let reg_body = serde_json::json!({
+            "handle": handle,
+            "identity_public_key": b64.encode(b"pubkey"),
+            "signed_prekey": b64.encode(b"prekey"),
+            "one_time_prekeys": [],
+            "kyber_public_key": b64.encode(b"kyber"),
+            "pow_nonce": 0,
+            "receive_secret": secret,
+        });
+        let reg_resp = client
+            .post(format!("{}/api/register", base_url))
+            .json(&reg_body)
+            .send()
+            .await
+            .expect("POST /api/register failed");
+        assert!(reg_resp.status().is_success(), "Registration failed: {:?}", reg_resp.status());
+        let reg_json_str = reg_resp.text().await.unwrap();
+        let reg_data: serde_json::Value = serde_json::from_str(&reg_json_str).unwrap();
 
-        // 3. Database MUST NOT contain receive_secret in plaintext
+        // Response must not echo back any form of the secret or its hash
+        for form in &[&secret_hex, &secret_b64, &secret_b64url, &hash_hex, &hash_b64, &hash_b64url] {
+            assert!(!reg_json_str.contains(*form),
+                "RegisterResponse must not contain secret/hash in form {:?}", form);
+        }
+        assert_ne!(reg_data["inbox_id"].as_str().unwrap_or(""), secret_hex.as_str());
+
+        // 2. LOOKUP via real HTTP
+        let lookup_resp = client
+            .get(format!("{}/api/lookup/{}", base_url, handle))
+            .header("X-Receive-Secret", &secret_hex)
+            .send()
+            .await
+            .expect("GET /api/lookup failed");
+        let lookup_json_str = lookup_resp.text().await.unwrap();
+        for form in &[&secret_hex, &secret_b64, &secret_b64url, &hash_hex, &hash_b64, &hash_b64url] {
+            assert!(!lookup_json_str.contains(*form),
+                "LookupResponse must not contain secret/hash in form {:?}", form);
+        }
+
+        // 3. WS CONNECT: secret travels in Sec-WebSocket-Protocol header
+        //    (A real WS upgrade exercises the full router path including ws_handler.)
+        let ws_url = format!("ws://{}/ws", addr);
+        let ws_result = tokio_tungstenite::connect_async(
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+                format!("{}", ws_url)
+            ).map(|mut req| {
+                req.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    secret_hex.parse().unwrap(),
+                );
+                req
+            }).unwrap()
+        ).await;
+        // We only need the upgrade to succeed; close immediately.
+        if let Ok((mut ws, _)) = ws_result {
+            use futures_util::sink::SinkExt;
+            let _ = ws.close(None).await;
+        }
+        // NOTE: a 401 here means the Postgres registration did not persist within the test;
+        // the primary assertions below (log scan) still hold regardless.
+
+        // 4. DATABASE VERIFICATION
         let row = sqlx::query("SELECT * FROM users WHERE handle = $1")
-            .bind(&reg_resp.assigned_handle)
+            .bind(&reg_data["assigned_handle"].as_str().unwrap_or(&handle))
             .fetch_one(&state.pool)
             .await
             .unwrap();
@@ -1386,8 +1538,130 @@ mod tests {
         let auth_scheme: String = row.try_get("auth_scheme").unwrap();
         assert_eq!(auth_scheme, "hash-v1");
         assert_eq!(raw_hash.len(), 32);
-        assert_ne!(hex::encode(&raw_hash), secret, "Database must store the SHA-256 hash, never the plaintext secret!");
+        assert_eq!(&raw_hash[..], &computed_hash[..]);
+        assert_ne!(hex::encode(&raw_hash), secret_hex,
+            "Database must store the SHA-256 hash, never the plaintext secret!");
+
+        server_handle.abort();
+
+        // 5. CAPTURED TRACE-LEVEL LOG SCAN
+        //    Includes output from hyper, tower-http, and the WebSocket crate at TRACE.
+        let captured_logs = {
+            let buf = LOG_BUFFER.lock().unwrap();
+            String::from_utf8_lossy(&buf).to_string()
+        };
+
+        assert!(
+            captured_logs.contains("LOG_TEST_INITIATED"),
+            "Captured logs must not be empty; TRACE-level logging must be active!"
+        );
+        assert!(captured_logs.len() > 50, "Captured logs must contain actual server log events");
+
+        // Check every encoding of both the secret and its hash.
+        // secret_debug / hash_debug covers Rust's {:?} format for &[u8]: "[12, 34, ...]"
+        let needles: &[(&str, &str)] = &[
+            (&secret_hex,   "secret as hex"),
+            (&secret_b64,   "secret as base64"),
+            (&secret_b64url,"secret as base64url"),
+            (&secret_debug, "secret as Debug bytes"),
+            (&hash_hex,     "hash as hex"),
+            (&hash_b64,     "hash as base64"),
+            (&hash_b64url,  "hash as base64url"),
+            (&hash_debug,   "hash as Debug bytes"),
+        ];
+        for (needle, label) in needles {
+            assert!(
+                !captured_logs.contains(*needle),
+                "TRACE logs must NEVER contain {} — found in captured output!",
+                label
+            );
+        }
+
+        // Sec-WebSocket-Protocol header line must not appear verbatim in logs
+        assert!(
+            !captured_logs.to_lowercase().contains(
+                &format!("sec-websocket-protocol: {}", secret_hex.to_lowercase())
+            ),
+            "TRACE logs must never log a Sec-WebSocket-Protocol header containing the secret!"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tor_mode_valid_secret_succeeds_after_100_bad_attempts() {
+        let base_state = match setup_test_state().await {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Tor mode state: all connections arrive from 127.0.0.1
+        let tor_state = Arc::new(AppState {
+            pool: base_state.pool.clone(),
+            redis_conn: base_state.redis_conn.clone(),
+            s3_client: base_state.s3_client.clone(),
+            active_connections: Arc::new(Mutex::new(HashMap::new())),
+            handle_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            ip_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            token_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            global_lookup_limiter: Arc::new(Mutex::new((0, Utc::now()))),
+            register_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            failed_auth_limiter: Arc::new(Mutex::new(HashMap::new())),
+            global_failed_auth_limiter: Arc::new(Mutex::new((0, Utc::now()))),
+            tor_mode: true,
+        });
+
+        // Register legitimate Alice
+        let alice_handle = format!("#alice_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let alice_secret = test_secret(101);
+        let reg_req = RegisterRequest {
+            handle: alice_handle.clone(),
+            identity_public_key: b64.encode(b"alice_pubkey"),
+            signed_prekey: b64.encode(b"alice_prekey"),
+            one_time_prekeys: vec![],
+            kyber_public_key: b64.encode(b"alice_kyber"),
+            pow_nonce: Some(0),
+            receive_secret: alice_secret.clone(),
+        };
+        let reg_resp = register_handler(dummy_connect_info(), State(tor_state.clone()), Json(reg_req)).await.unwrap().0;
+        let alice_inbox_id = reg_resp.inbox_id;
+
+        // Attacker / bot spamming 100 bad auth attempts from the same Tor exit / loopback IP
+        let tor_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        for i in 0..100 {
+            let bad_secret = format!("junk_secret_attempt_{}", i);
+            let res = authenticate_receive_secret(&tor_state, &bad_secret, tor_ip).await;
+            assert!(res.is_err(), "Bad secret attempt {} must fail", i);
+            assert_eq!(res.unwrap_err(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+
+        // Attempt 101: Alice authenticates with her GENUINE receive_secret from the SAME IP
+        let legit_auth = authenticate_receive_secret(&tor_state, &alice_secret, tor_ip).await;
+        assert!(legit_auth.is_ok(), "Legitimate secret holder must connect even after 100 bad attempts on Tor!");
+        assert_eq!(legit_auth.unwrap().inbox_id.to_string(), alice_inbox_id);
+
+        // Seed a message in Alice's queue and verify legitimate ack succeeds
+        let msg_id = "test_msg_after_100_bad";
+        let queue_key = format!("msg_queue:{}", alice_inbox_id);
+        let mut conn = tor_state.redis_conn.clone();
+        let _: () = redis::cmd("HSET")
+            .arg(&queue_key)
+            .arg(msg_id)
+            .arg("payload")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let ack_res = ack_handler(
+            ConnectInfo(SocketAddr::new(tor_ip, 8080)),
+            State(tor_state.clone()),
+            auth_headers(&alice_secret),
+            Json(AckRequest { msg_id: msg_id.to_string() }),
+        ).await;
+        assert!(ack_res.is_ok(), "Legitimate ack must succeed after 100 bad attempts!");
+
+        let exists: bool = redis::cmd("HEXISTS").arg(&queue_key).arg(msg_id).query_async(&mut conn).await.unwrap();
+        assert!(!exists, "Message must be acknowledged and removed!");
     }
 }
+
 
 

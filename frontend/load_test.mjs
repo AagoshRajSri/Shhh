@@ -39,7 +39,7 @@ async function registerUser(i) {
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        return { handle, token: data.routing_token };
+        return { handle, token: data.inbox_id };
     } catch (e) {
         metrics.errors++;
         return null;
@@ -113,7 +113,7 @@ async function run() {
             const recipient = users[Math.floor(Math.random() * users.length)];
             
             const envelope = {
-                to_routing_token: recipient.token,
+                to_inbox_id: recipient.token,
                 encrypted_payload: "MOCK_ENCRYPTED_BLOB_" + Date.now()
             };
             

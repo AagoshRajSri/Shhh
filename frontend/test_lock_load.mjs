@@ -33,7 +33,7 @@ async function runLoadTest() {
             for (let j = 0; j < 10; j++) {
                 promises.push(new Promise((resolve) => {
                     ws.send(JSON.stringify({
-                        to_routing_token: `test-token-${j}`,
+                        to_inbox_id: `test-token-${j}`,
                         encrypted_payload: "dummy"
                     }), () => resolve());
                 }));

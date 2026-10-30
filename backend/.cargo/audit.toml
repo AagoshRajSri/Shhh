@@ -8,10 +8,24 @@ ignore = [
     "RUSTSEC-2026-0099", # upstream in aws-smithy-http-client (rustls-webpki 0.101.7)
     "RUSTSEC-2026-0104", # upstream in aws-smithy-http-client (rustls-webpki 0.101.7)
     "RUSTSEC-2026-0258", # upstream in hyper 0.14 (h2 0.3.27)
-    "RUSTSEC-2023-0071", # upstream in rsa crate (timing sidechannel)
-    "RUSTSEC-2026-0386", # upstream in tokio (AsyncFd::new unsoundness, not used in codebase; re-evaluate when tokio patch is released)
-    "RUSTSEC-2026-0387", # upstream in crypto-bigint via aws-sigv4/p256/elliptic-curve; re-evaluate when aws-sdk-s3 / aws-sigv4 upgrades dependencies
+    # RUSTSEC-2023-0071: "Marvin Attack: potential key recovery through timing sidechannels" (CVSS 5.9 Medium, crypto-failure).
+    # Unpatched upstream in rsa crate; present only as a Cargo.lock entry from sqlx optional MySQL driver.
+    # Verified: `cargo tree -i rsa` produces 0 matches (not compiled into backend binary).
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0386: "Unsoundness in tokio::io::unix::AsyncFd::new" (Informational/Unsound, memory-corruption).
+    # Upstream in tokio < 1.51.6 / < 1.53.3.
+    # Verified: `grep -r AsyncFd backend/` returns 0 matches (codebase does not use AsyncFd).
+    # Action: Re-evaluate when tokio patch is released for 1.36.x series or upgrade tokio.
+    "RUSTSEC-2026-0386",
+
+    # RUSTSEC-2026-0387: "Multiple timing variability issues in operations intended to be constant-time" (crypto-failure).
+    # Upstream in crypto-bigint < 0.7.6, pulled via aws-sigv4/p256/elliptic-curve for aws-sdk-s3.
+    # Action: Re-evaluate when aws-sdk-s3 / aws-sigv4 releases an update pulling crypto-bigint >= 0.7.6.
+    "RUSTSEC-2026-0387",
 ]
 
 [yanked]
-enabled = false # yanked upstream dependency in aws-smithy-types (yoke-derive 0.8.3); re-evaluate when aws-smithy updates yoke
+# Check for yanked dependencies (default: true; yoke-derive updated to 0.8.4)
+
+
